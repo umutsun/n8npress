@@ -732,6 +732,168 @@ class LuwiPress_WebMCP {
      * internal-link audit, and WooCommerce product snapshot / rollback.
      * Built for DNS-swap + bulk-edit safety.
      */
+    private function register_forms_tools() {
+        $this->register_tool( 'forms_list', array(
+            'description' => 'List Fluent Forms forms: id, title, status, entry count, [fluentform id] shortcode. Use to find a form to embed or edit. Read-only.',
+            'inputSchema' => array( 'type' => 'object', 'properties' => new stdClass() ),
+            'annotations' => array( 'title' => 'List Forms', 'readOnlyHint' => true, 'idempotentHint' => true, 'openWorldHint' => false ),
+        ), function () {
+            return $this->proxy_rest_post( 'LuwiPress_Forms', 'rest_list', array() );
+        } );
+
+        $this->register_tool( 'forms_get', array(
+            'description' => 'Get one Fluent Forms form: title, status, full form_fields JSON (the canonical FF field/step layout), appearance settings, shortcode. Read an existing form to learn the exact field-JSON shape for this FF version before creating/updating. Read-only.',
+            'inputSchema' => array(
+                'type'       => 'object',
+                'properties' => array( 'id' => array( 'type' => 'integer', 'description' => 'Form ID (required).' ) ),
+                'required'   => array( 'id' ),
+            ),
+            'annotations' => array( 'title' => 'Get Form', 'readOnlyHint' => true, 'idempotentHint' => true, 'openWorldHint' => false ),
+        ), function ( $args ) {
+            return $this->proxy_rest_post( 'LuwiPress_Forms', 'rest_get', $args );
+        } );
+
+        $this->register_tool( 'forms_create', array(
+            'description' => 'Create a Fluent Forms form. form_fields is the canonical FF layout JSON — an object {"fields":[...],"submitButton":{...}}; multi-step wizards use form_step container fields. Tip: forms_get an existing form first to copy the exact shape for this FF version. Returns the new id + [fluentform id] shortcode + editor URL.',
+            'inputSchema' => array(
+                'type'       => 'object',
+                'properties' => array(
+                    'title'               => array( 'type' => 'string', 'description' => 'Form title (required).' ),
+                    'form_fields'         => array( 'description' => 'FF field layout: object {fields:[...],submitButton:{...}} or its JSON string (required).' ),
+                    'status'              => array( 'type' => 'string', 'description' => "'published' (default) | 'unpublished'." ),
+                    'appearance_settings' => array( 'description' => 'Optional FF appearance settings object.' ),
+                ),
+                'required'   => array( 'title', 'form_fields' ),
+            ),
+            'annotations' => array( 'title' => 'Create Form', 'readOnlyHint' => false, 'destructiveHint' => false, 'idempotentHint' => false, 'openWorldHint' => false ),
+        ), function ( $args ) {
+            return $this->proxy_rest_post( 'LuwiPress_Forms', 'rest_create', $args );
+        } );
+
+        $this->register_tool( 'forms_update', array(
+            'description' => 'Update a Fluent Forms form (partial). Send id + any of: title, form_fields (full FF layout JSON — replaces the layout), status, appearance_settings.',
+            'inputSchema' => array(
+                'type'       => 'object',
+                'properties' => array(
+                    'id'                  => array( 'type' => 'integer', 'description' => 'Form ID (required).' ),
+                    'title'               => array( 'type' => 'string' ),
+                    'form_fields'         => array( 'description' => 'Full FF field layout JSON (replaces current layout).' ),
+                    'status'              => array( 'type' => 'string', 'description' => "'published' | 'unpublished'." ),
+                    'appearance_settings' => array( 'description' => 'FF appearance settings object.' ),
+                ),
+                'required'   => array( 'id' ),
+            ),
+            'annotations' => array( 'title' => 'Update Form', 'readOnlyHint' => false, 'destructiveHint' => false, 'idempotentHint' => false, 'openWorldHint' => false ),
+        ), function ( $args ) {
+            return $this->proxy_rest_post( 'LuwiPress_Forms', 'rest_update', $args );
+        } );
+
+        $this->register_tool( 'forms_entries', array(
+            'description' => 'Read recent submissions (DB entries) for a Fluent Forms form — paged. Each entry has its decoded response data + status + created_at. Read-only.',
+            'inputSchema' => array(
+                'type'       => 'object',
+                'properties' => array(
+                    'id'       => array( 'type' => 'integer', 'description' => 'Form ID (required).' ),
+                    'per_page' => array( 'type' => 'integer', 'description' => '1..100 (default 20).' ),
+                    'page'     => array( 'type' => 'integer', 'description' => 'Page (default 1).' ),
+                ),
+                'required'   => array( 'id' ),
+            ),
+            'annotations' => array( 'title' => 'Form Entries', 'readOnlyHint' => true, 'idempotentHint' => true, 'openWorldHint' => false ),
+        ), function ( $args ) {
+            return $this->proxy_rest_post( 'LuwiPress_Forms', 'rest_entries', $args );
+        } );
+    }
+
+    private function register_backup_tools() {
+        $this->register_tool( 'backup_diag', array(
+            'description' => 'UpdraftPlus availability + health on THIS site: version, updraft_dir (writable?), history class, whether the backup hooks are attached, and WP-Cron status (a real backup only completes if cron processes updraft_backup_resume). Call before triggering a backup or a migration pull. Read-only.',
+            'inputSchema' => array( 'type' => 'object', 'properties' => new stdClass() ),
+            'annotations' => array( 'title' => 'Backup Diag', 'readOnlyHint' => true, 'idempotentHint' => true, 'openWorldHint' => false ),
+        ), function () {
+            return $this->proxy_rest_post( 'LuwiPress_Backup_Bridge', 'handle_diag', array() );
+        } );
+
+        $this->register_tool( 'backup_run', array(
+            'description' => 'Trigger an UpdraftPlus backup on THIS site (the migration SOURCE). scope: full (db+files, default) | db | files. nocloud=true (default) keeps the archive local so it can be pulled by another site. Returns the job nonce (may be null until history is written — poll backup_status). Backup starts synchronously; completion of a large backup depends on WP-Cron.',
+            'inputSchema' => array(
+                'type'       => 'object',
+                'properties' => array(
+                    'scope'    => array( 'type' => 'string',  'description' => "'full' (default) | 'db' | 'files'." ),
+                    'nocloud'  => array( 'type' => 'boolean', 'description' => 'Keep archive local only, no remote upload (default true).' ),
+                    'label'    => array( 'type' => 'string',  'description' => 'Human label stored on the backup set.' ),
+                    'entities' => array( 'type' => 'array', 'items' => array( 'type' => 'string' ), 'description' => "Optional file-entity subset for scope=full|files: any of plugins,themes,uploads,others." ),
+                ),
+            ),
+            'annotations' => array( 'title' => 'Run Backup', 'readOnlyHint' => false, 'destructiveHint' => false, 'idempotentHint' => false, 'openWorldHint' => false ),
+        ), function ( $args ) {
+            return $this->proxy_rest_post( 'LuwiPress_Backup_Bridge', 'handle_run', $args );
+        } );
+
+        $this->register_tool( 'backup_status', array(
+            'description' => 'Live backup job status on THIS site: jobstatus, finished flag, coarse percent, resume_due. Omit nonce to get the current LIVE (unfinished) job; pass a nonce to inspect a specific job even after it finished. Poll after backup_run until finished==true. Read-only.',
+            'inputSchema' => array(
+                'type'       => 'object',
+                'properties' => array( 'nonce' => array( 'type' => 'string', 'description' => 'Specific job nonce (optional).' ) ),
+            ),
+            'annotations' => array( 'title' => 'Backup Status', 'readOnlyHint' => true, 'idempotentHint' => true, 'openWorldHint' => false ),
+        ), function ( $args ) {
+            return $this->proxy_rest_post( 'LuwiPress_Backup_Bridge', 'handle_status', $args );
+        } );
+
+        $this->register_tool( 'backup_list', array(
+            'description' => 'List backup sets on THIS site with per-archive on-disk status, size, and an authenticated download_url for each file. complete=true means every archive is on local disk (pullable); false means some live only in remote storage. This is the source for a cross-server pull. Read-only.',
+            'inputSchema' => array(
+                'type'       => 'object',
+                'properties' => array( 'limit' => array( 'type' => 'integer', 'description' => '1..100 (default 20).' ) ),
+            ),
+            'annotations' => array( 'title' => 'List Backups', 'readOnlyHint' => true, 'idempotentHint' => true, 'openWorldHint' => false ),
+        ), function ( $args ) {
+            return $this->proxy_rest_post( 'LuwiPress_Backup_Bridge', 'handle_list', $args );
+        } );
+
+        $this->register_tool( 'backup_pull', array(
+            'description' => 'TARGET-side migration ingest: this site reaches out to a trusted SOURCE LuwiPress site and streams the named backup archives into its own wp-content/updraft/. Provide source_url (base, no trailing slash), source_token (the source bearer), and files[] (filenames from the source backup_list). Run on the NEW site (e.g. arsha-vps). Then call backup_rescan, then backup_restore.',
+            'inputSchema' => array(
+                'type'       => 'object',
+                'properties' => array(
+                    'source_url'   => array( 'type' => 'string', 'description' => 'Source site base URL, no trailing slash (required).' ),
+                    'source_token' => array( 'type' => 'string', 'description' => "Source site's LuwiPress bearer token (required)." ),
+                    'files'        => array( 'type' => 'array', 'items' => array( 'type' => 'string' ), 'description' => 'Archive filenames to pull, from the source backup_list (required).' ),
+                ),
+                'required'   => array( 'source_url', 'source_token', 'files' ),
+            ),
+            'annotations' => array( 'title' => 'Pull Backup', 'readOnlyHint' => false, 'destructiveHint' => false, 'idempotentHint' => false, 'openWorldHint' => true ),
+        ), function ( $args ) {
+            return $this->proxy_rest_post( 'LuwiPress_Backup_Bridge', 'handle_pull', $args );
+        } );
+
+        $this->register_tool( 'backup_rescan', array(
+            'description' => 'TARGET-side: make UpdraftPlus re-enumerate wp-content/updraft/ so freshly-pulled archives become a restorable set. Returns the now-visible sets (with timestamp + nonce) — pick one for backup_restore.',
+            'inputSchema' => array( 'type' => 'object', 'properties' => new stdClass() ),
+            'annotations' => array( 'title' => 'Rescan Backups', 'readOnlyHint' => false, 'destructiveHint' => false, 'idempotentHint' => true, 'openWorldHint' => false ),
+        ), function ( $args ) {
+            return $this->proxy_rest_post( 'LuwiPress_Backup_Bridge', 'handle_rescan', $args );
+        } );
+
+        $this->register_tool( 'backup_restore', array(
+            'description' => 'TARGET-side restore guidance (mode=assist, default & SAFE): verifies a rescanned set is restorable and returns the set to click Restore on in the UpdraftPlus UI PLUS the exact `wp search-replace` command to fix the domain (free UpdraftPlus does not auto-rewrite URLs). It does NOT auto-run the restore — a programmatic restore is unsupported and can brick the site mid-request. Provide timestamp (from backup_rescan), old_url (source domain) and new_url (this site).',
+            'inputSchema' => array(
+                'type'       => 'object',
+                'properties' => array(
+                    'mode'      => array( 'type' => 'string', 'description' => "'assist' (default, safe) | 'execute' (intentionally not auto-run)." ),
+                    'timestamp' => array( 'type' => 'integer', 'description' => 'Backup set timestamp from backup_rescan (required).' ),
+                    'old_url'   => array( 'type' => 'string', 'description' => 'Source domain to replace, e.g. https://demo.flybydeniz.com.' ),
+                    'new_url'   => array( 'type' => 'string', 'description' => 'This site URL (defaults to home_url()).' ),
+                ),
+                'required'   => array( 'timestamp' ),
+            ),
+            'annotations' => array( 'title' => 'Restore (assist)', 'readOnlyHint' => true, 'idempotentHint' => true, 'openWorldHint' => false ),
+        ), function ( $args ) {
+            return $this->proxy_rest_post( 'LuwiPress_Backup_Bridge', 'handle_restore', $args );
+        } );
+    }
+
     private function register_migration_tools() {
         // ── FR-042: Rank Math Redirections CRUD ──────────────────────────
         $this->register_tool( 'redirect_diag', array(
@@ -921,6 +1083,8 @@ class LuwiPress_WebMCP {
             'ucp'              => 'register_ucp_tools',
             'vendors'          => 'register_vendors_tools',
             'booking'          => 'register_booking_tools',
+            'forms'            => 'register_forms_tools',
+            'backup'           => 'register_backup_tools',
             'migration'        => 'register_migration_tools',
         );
 
@@ -4991,6 +5155,9 @@ class LuwiPress_WebMCP {
             foreach ( $targets as $lang ) {
                 // Dedupe any already-pending event for this (post, lang) pair.
                 wp_clear_scheduled_hook( 'luwipress_elementor_translate_single', array( $post_id, $lang ) );
+                // An explicit operator request gets a fresh attempt budget, otherwise a
+                // page that previously exhausted its retries could never be requeued.
+                delete_post_meta( $post_id, LuwiPress_Elementor::translation_attempt_meta_key( $lang ) );
                 wp_schedule_single_event( time() + $offset, 'luwipress_elementor_translate_single', array( $post_id, $lang ) );
                 $queued[] = $lang;
                 $offset  += 8; // stagger so cron does not collapse them into one process
@@ -5006,6 +5173,61 @@ class LuwiPress_WebMCP {
                 'queued_languages' => $queued,
                 'note'             => 'Each language runs in the background: structure is re-synced from the source page and all text is AI-translated in safe chunks. Poll the page render or system_logs for completion.',
             );
+        } );
+
+        $this->register_tool( 'elementor_translation_queue', array(
+            'description' => 'List PENDING background Elementor translation jobs (wp-cron queue). This is the queue that translation_status cannot see — translation_status only counts the standard non-Elementor path. Each entry returns post_id, title, language, when it is due, how many attempts it has already burned (attempts/max_attempts), and the last recorded phase (queued|translating|completed|failed|failed_max_attempts|cancelled). Filter with post_id and/or language. Use this BEFORE requeueing anything, to check whether a job is already waiting.',
+            'inputSchema' => array(
+                'type'       => 'object',
+                'properties' => array(
+                    'post_id'  => array( 'type' => 'integer', 'description' => 'Only show entries for this source post' ),
+                    'language' => array( 'type' => 'string', 'description' => 'Only show entries for this target language code' ),
+                ),
+                'required'   => array(),
+            ),
+            'annotations' => array(
+                'title'          => 'List Elementor Translation Queue',
+                'readOnlyHint'   => true,
+                'idempotentHint' => true,
+                'openWorldHint'  => false,
+            ),
+        ), function ( $args ) {
+            if ( ! class_exists( 'LuwiPress_Elementor' ) ) {
+                return array( 'error' => 'Elementor module not available' );
+            }
+            return LuwiPress_Elementor::get_instance()->list_translation_queue(
+                intval( $args['post_id'] ?? 0 ),
+                sanitize_text_field( (string) ( $args['language'] ?? '' ) )
+            );
+        } );
+
+        $this->register_tool( 'elementor_translation_queue_cancel', array(
+            'description' => 'Cancel the PENDING background translation job(s) for ONE (post_id, language) pair, leaving every other queued job alone. Also stamps the post\'s translation status as cancelled. Use elementor_translation_queue first to see what is waiting. To wipe the entire queue for all posts and languages instead, POST /elementor/translate-queue with action=cancel.',
+            'inputSchema' => array(
+                'type'       => 'object',
+                'properties' => array(
+                    'post_id'  => array( 'type' => 'integer', 'description' => 'Source post/page ID (required)' ),
+                    'language' => array( 'type' => 'string', 'description' => 'Target language code, e.g. de (required)' ),
+                ),
+                'required'   => array( 'post_id', 'language' ),
+            ),
+            'annotations' => array(
+                'title'           => 'Cancel One Elementor Translation Job',
+                'readOnlyHint'    => false,
+                'destructiveHint' => false,
+                'idempotentHint'  => true,
+                'openWorldHint'   => false,
+            ),
+        ), function ( $args ) {
+            if ( ! class_exists( 'LuwiPress_Elementor' ) ) {
+                return array( 'error' => 'Elementor module not available' );
+            }
+            $post_id  = intval( $args['post_id'] ?? 0 );
+            $language = sanitize_text_field( (string) ( $args['language'] ?? '' ) );
+            if ( ! $post_id || '' === $language ) {
+                return array( 'error' => 'post_id and language are required' );
+            }
+            return LuwiPress_Elementor::get_instance()->cancel_translation_queue_entry( $post_id, $language );
         } );
 
         $this->register_tool( 'elementor_get_widget', array(
@@ -5040,7 +5262,7 @@ class LuwiPress_WebMCP {
         } );
 
         $this->register_tool( 'elementor_set_widget_text', array(
-            'description' => 'Update text content of an Elementor widget. Works with heading (title), text-editor (editor), button (text), image-box (title_text, description_text), tabs/accordion (tabs:0:tab_title), etc.',
+            'description' => 'Update text content of an Elementor widget. Values may be strings OR structured values (a whole repeater array, or a link-control object like {"url":"/x/","is_external":""}). Repeater rows can also be addressed one field at a time with an indexed path: "tabs:0:tab_title", "items:2:title". The write is ATOMIC per widget: if any field is rejected, nothing is written and the response names the offending field. Passing a bare string to a link control fills its url key instead of replacing the object; passing a bare string to any other structured control is refused rather than silently breaking the render. Read the widget first (elementor_get_widget) to see the real field shapes.',
             'inputSchema' => array(
                 'type'       => 'object',
                 'properties' => array(
@@ -5048,7 +5270,7 @@ class LuwiPress_WebMCP {
                     'element_id' => array( 'type' => 'string', 'description' => 'Elementor element ID (required)' ),
                     'texts'      => array(
                         'type'        => 'object',
-                        'description' => 'Text fields to update. Examples: {"title": "New Title"}, {"editor": "<p>New content</p>"}, {"text": "Click Me"}',
+                        'description' => 'Fields to update. Examples: {"title": "New Title"}, {"editor": "<p>New content</p>"}, {"tabs:0:tab_title": "Erste"}, {"tabs": [{"tab_title": "Eins"}, {"tab_title": "Zwei"}]}, {"cta_url": {"url": "/de/meister/", "is_external": ""}}',
                     ),
                 ),
                 'required'   => array( 'post_id', 'element_id', 'texts' ),
@@ -5108,7 +5330,7 @@ class LuwiPress_WebMCP {
         } );
 
         $this->register_tool( 'elementor_bulk_update', array(
-            'description' => 'Batch update multiple Elementor elements in one save. Each change can modify text and/or styles. Styles accept CSS names. Example: [{"widget_id": "abc", "texts": {"title": "New"}, "styles": {"color": "#fff", "font-size": "24px"}}]',
+            'description' => 'Batch update multiple Elementor elements in one save. Each change can modify text and/or styles. texts accepts the same values as elementor_set_widget_text (strings, whole repeater arrays, link objects, and indexed "tabs:0:tab_title" paths) and is applied atomically per widget. Styles accept CSS names. The result maps each widget_id to "updated", "not_found", or {status:"rejected", errors:[...]}. Example: [{"widget_id": "abc", "texts": {"title": "New"}, "styles": {"color": "#fff", "font-size": "24px"}}]',
             'inputSchema' => array(
                 'type'       => 'object',
                 'properties' => array(
@@ -7083,6 +7305,161 @@ class LuwiPress_WebMCP {
             return;
         }
 
+        // --- Product write (WC CRUD): price / stock / featured image / status. ---
+        // content_create_post can make a product post but cannot set price meta
+        // (protected). This closes that gap through the proper WC CRUD so _price,
+        // _regular_price and the product lookup table stay consistent.
+        $this->register_tool( 'product_update', array(
+            'description' => 'Update a WooCommerce product through the WC CRUD (recalculates _price + the product lookup table — the correct, safe way, unlike raw meta writes). Send id + any of: regular_price, sale_price (empty string clears it), sku, stock_status (instock|outofstock|onbackorder), manage_stock, stock_quantity, featured (bool), featured_image_id (WP attachment ID → product thumbnail), gallery_image_ids (array of attachment IDs), status (publish|draft|pending|private). Setting regular_price is what makes a product purchasable so Add to cart works. Returns the resulting price/stock/image_id + is_purchasable.',
+            'inputSchema' => array(
+                'type'       => 'object',
+                'properties' => array(
+                    'id'                => array( 'type' => 'integer', 'description' => 'Product ID (required).' ),
+                    'regular_price'     => array( 'type' => 'string', 'description' => 'Regular price, e.g. "120" or "120.00". Required for the product to be purchasable.' ),
+                    'sale_price'        => array( 'type' => 'string', 'description' => 'Sale price; pass "" to clear it.' ),
+                    'sku'               => array( 'type' => 'string' ),
+                    'stock_status'      => array( 'type' => 'string', 'description' => 'instock | outofstock | onbackorder' ),
+                    'manage_stock'      => array( 'type' => 'boolean' ),
+                    'stock_quantity'    => array( 'type' => 'integer' ),
+                    'featured'          => array( 'type' => 'boolean', 'description' => 'Mark as a WooCommerce featured product.' ),
+                    'featured_image_id' => array( 'type' => 'integer', 'description' => 'WP media attachment ID to use as the product image (thumbnail).' ),
+                    'gallery_image_ids' => array( 'type' => 'array', 'description' => 'Array of media attachment IDs for the product gallery.' ),
+                    'status'            => array( 'type' => 'string', 'description' => 'publish | draft | pending | private' ),
+                ),
+                'required'   => array( 'id' ),
+            ),
+            'annotations' => array( 'title' => 'Update Product', 'readOnlyHint' => false, 'destructiveHint' => false, 'idempotentHint' => false, 'openWorldHint' => false ),
+        ), function ( $args ) {
+            if ( ! function_exists( 'wc_get_product' ) ) {
+                return array( 'error' => 'WooCommerce not active' );
+            }
+            $id      = absint( $args['id'] ?? 0 );
+            $product = $id ? wc_get_product( $id ) : null;
+            if ( ! $product ) {
+                return array( 'error' => 'Product not found', 'id' => $id );
+            }
+            if ( array_key_exists( 'regular_price', $args ) ) {
+                $product->set_regular_price( wc_format_decimal( $args['regular_price'] ) );
+            }
+            if ( array_key_exists( 'sale_price', $args ) ) {
+                $product->set_sale_price( '' === $args['sale_price'] ? '' : wc_format_decimal( $args['sale_price'] ) );
+            }
+            if ( isset( $args['sku'] ) ) {
+                try {
+                    $product->set_sku( sanitize_text_field( $args['sku'] ) );
+                } catch ( \Exception $e ) {
+                    return array( 'error' => 'SKU: ' . $e->getMessage() );
+                }
+            }
+            if ( isset( $args['stock_status'] ) ) {
+                $product->set_stock_status( sanitize_text_field( $args['stock_status'] ) );
+            }
+            if ( isset( $args['manage_stock'] ) ) {
+                $product->set_manage_stock( (bool) $args['manage_stock'] );
+            }
+            if ( isset( $args['stock_quantity'] ) ) {
+                $product->set_stock_quantity( intval( $args['stock_quantity'] ) );
+            }
+            if ( isset( $args['featured'] ) ) {
+                $product->set_featured( (bool) $args['featured'] );
+            }
+            if ( isset( $args['featured_image_id'] ) ) {
+                $product->set_image_id( absint( $args['featured_image_id'] ) );
+            }
+            if ( isset( $args['gallery_image_ids'] ) && is_array( $args['gallery_image_ids'] ) ) {
+                $product->set_gallery_image_ids( array_map( 'absint', $args['gallery_image_ids'] ) );
+            }
+            if ( isset( $args['status'] ) ) {
+                $product->set_status( sanitize_text_field( $args['status'] ) );
+            }
+            $product->save();
+            $fresh = wc_get_product( $id );
+            return array(
+                'id'            => $id,
+                'updated'       => true,
+                'name'          => $fresh->get_name(),
+                'regular_price' => $fresh->get_regular_price(),
+                'sale_price'    => $fresh->get_sale_price(),
+                'price'         => $fresh->get_price(),
+                'price_html'    => wp_strip_all_tags( $fresh->get_price_html() ),
+                'sku'           => $fresh->get_sku(),
+                'stock_status'  => $fresh->get_stock_status(),
+                'image_id'      => $fresh->get_image_id(),
+                'status'        => $fresh->get_status(),
+                'purchasable'   => $fresh->is_purchasable(),
+                'permalink'     => get_permalink( $id ),
+            );
+        } );
+
+        // --- Store visibility: WooCommerce "Coming soon" vs Live (WC 9.1+). ---
+        $this->register_tool( 'store_visibility_set', array(
+            'description' => "Toggle the WooCommerce site-visibility 'Coming soon' feature. mode 'live' makes the store public (customers can browse + buy); mode 'coming_soon' shows the coming-soon page to logged-out visitors. Optional store_pages_only restricts coming-soon to shop/product/cart/checkout only (rest of the site stays public). Returns the resulting option values.",
+            'inputSchema' => array(
+                'type'       => 'object',
+                'properties' => array(
+                    'mode'             => array( 'type' => 'string', 'description' => "'live' | 'coming_soon' (required)." ),
+                    'store_pages_only' => array( 'type' => 'boolean', 'description' => 'When coming_soon: restrict it to store pages only (default false = whole site).' ),
+                ),
+                'required'   => array( 'mode' ),
+            ),
+            'annotations' => array( 'title' => 'Set Store Visibility', 'readOnlyHint' => false, 'destructiveHint' => false, 'idempotentHint' => true, 'openWorldHint' => false ),
+        ), function ( $args ) {
+            $mode = sanitize_text_field( $args['mode'] ?? '' );
+            if ( ! in_array( $mode, array( 'live', 'coming_soon' ), true ) ) {
+                return array( 'error' => "mode must be 'live' or 'coming_soon'" );
+            }
+            update_option( 'woocommerce_coming_soon', 'coming_soon' === $mode ? 'yes' : 'no' );
+            if ( isset( $args['store_pages_only'] ) ) {
+                update_option( 'woocommerce_store_pages_only', $args['store_pages_only'] ? 'yes' : 'no' );
+            }
+            return array(
+                'mode'             => $mode,
+                'coming_soon'      => get_option( 'woocommerce_coming_soon' ),
+                'store_pages_only' => get_option( 'woocommerce_store_pages_only' ),
+            );
+        } );
+
+        // --- Manual / offline payment (Mobile Money, bank transfer). ---
+        $this->register_tool( 'wc_manual_payment_set', array(
+            'description' => "Enable a manual/offline payment method at checkout — for Mobile Money or bank transfer where the customer pays off-site and the store confirms manually. Uses WooCommerce's built-in Direct bank transfer (BACS) gateway, retitled. Provide title (e.g. 'Mobile Money'), instructions (shown on the order + thank-you page, e.g. 'Pay via Mobile Money to +250 785 156 670 and use your order number as reference'), optional description. enabled=false turns it off. Orders placed with it stay On-hold until you confirm payment.",
+            'inputSchema' => array(
+                'type'       => 'object',
+                'properties' => array(
+                    'title'        => array( 'type' => 'string', 'description' => "Method title at checkout, e.g. 'Mobile Money'." ),
+                    'instructions' => array( 'type' => 'string', 'description' => 'Payment instructions shown to the customer on the order + thank-you page.' ),
+                    'description'  => array( 'type' => 'string', 'description' => 'Short description under the title at checkout (optional).' ),
+                    'enabled'      => array( 'type' => 'boolean', 'description' => 'Enable (default true) or disable the method.' ),
+                ),
+            ),
+            'annotations' => array( 'title' => 'Set Manual Payment', 'readOnlyHint' => false, 'destructiveHint' => false, 'idempotentHint' => true, 'openWorldHint' => false ),
+        ), function ( $args ) {
+            if ( ! class_exists( 'WooCommerce' ) ) {
+                return array( 'error' => 'WooCommerce not active' );
+            }
+            $enabled  = array_key_exists( 'enabled', $args ) ? (bool) $args['enabled'] : true;
+            $settings = get_option( 'woocommerce_bacs_settings', array() );
+            if ( ! is_array( $settings ) ) {
+                $settings = array();
+            }
+            $settings['enabled'] = $enabled ? 'yes' : 'no';
+            if ( isset( $args['title'] ) ) {
+                $settings['title'] = sanitize_text_field( $args['title'] );
+            }
+            if ( isset( $args['description'] ) ) {
+                $settings['description'] = wp_kses_post( $args['description'] );
+            }
+            if ( isset( $args['instructions'] ) ) {
+                $settings['instructions'] = wp_kses_post( $args['instructions'] );
+            }
+            update_option( 'woocommerce_bacs_settings', $settings );
+            return array(
+                'gateway'      => 'bacs',
+                'enabled'      => $enabled,
+                'title'        => $settings['title'] ?? '',
+                'instructions' => $settings['instructions'] ?? '',
+            );
+        } );
+
         $this->register_tool( 'woo_list_orders', array(
             'description' => 'List WooCommerce orders with filtering by status, date, customer; supports orderby/order for sorting and date_after+date_before for bounded ranges.',
             'inputSchema' => array(
@@ -7370,6 +7747,78 @@ class LuwiPress_WebMCP {
     /* ───────────────────── Media Library Tools ─────────────────────── */
 
     private function register_media_tools() {
+
+        // Upload a file to the Media Library from base64 data — for local files
+        // that are not reachable by a public URL (media_upload_from_url can't
+        // reach them). Lets an AI push images/video directly into WP media.
+        $this->register_tool( 'media_upload_base64', array(
+            'description' => 'Upload an image or MP4 to the Media Library from base64-encoded data — use this when the file lives on the operator machine and is NOT reachable by a public URL (otherwise prefer media_upload_from_url). Provide filename (with extension) + data_base64 (raw base64, no "data:...;base64," prefix). Max 12 MB. Returns the new attachment id + url; wire it into a product via product_update featured_image_id or an Elementor widget.',
+            'inputSchema' => array(
+                'type'       => 'object',
+                'properties' => array(
+                    'filename'    => array( 'type' => 'string', 'description' => 'File name with extension, e.g. "no6-green.jpg" (required).' ),
+                    'data_base64' => array( 'type' => 'string', 'description' => 'Base64-encoded file contents, with NO "data:...;base64," prefix (required).' ),
+                    'title'       => array( 'type' => 'string', 'description' => 'Attachment title (optional; defaults to the filename).' ),
+                    'alt_text'    => array( 'type' => 'string', 'description' => 'Image alt text (optional).' ),
+                    'post_id'     => array( 'type' => 'integer', 'description' => 'Attach to this post ID (optional).' ),
+                ),
+                'required'   => array( 'filename', 'data_base64' ),
+            ),
+            'annotations' => array( 'title' => 'Upload Media (base64)', 'readOnlyHint' => false, 'destructiveHint' => false, 'idempotentHint' => false, 'openWorldHint' => false ),
+        ), function ( $args ) {
+            $filename = sanitize_file_name( (string) ( $args['filename'] ?? '' ) );
+            $b64      = (string) ( $args['data_base64'] ?? '' );
+            if ( '' === $filename || '' === $b64 ) {
+                return array( 'error' => 'filename and data_base64 are required' );
+            }
+            // Tolerate an accidental data-URI prefix.
+            if ( 0 === strpos( $b64, 'data:' ) && false !== strpos( $b64, ',' ) ) {
+                $b64 = substr( $b64, strpos( $b64, ',' ) + 1 );
+            }
+            $data = base64_decode( $b64, true );
+            if ( false === $data || '' === $data ) {
+                return array( 'error' => 'invalid base64 data' );
+            }
+            if ( strlen( $data ) > 12 * 1024 * 1024 ) {
+                return array( 'error' => 'file too large (>12 MB)' );
+            }
+            $ft = wp_check_filetype( $filename );
+            if ( empty( $ft['type'] ) || ( 0 !== strpos( $ft['type'], 'image/' ) && 'video/mp4' !== $ft['type'] ) ) {
+                return array( 'error' => 'unsupported file type: ' . ( $ft['type'] ?: '(unknown)' ) . ' — allowed: images, video/mp4' );
+            }
+            if ( ! function_exists( 'wp_upload_bits' ) ) {
+                require_once ABSPATH . 'wp-admin/includes/file.php';
+            }
+            $up = wp_upload_bits( $filename, null, $data );
+            if ( ! empty( $up['error'] ) ) {
+                return array( 'error' => $up['error'] );
+            }
+            $file = $up['file'];
+            require_once ABSPATH . 'wp-admin/includes/image.php';
+            $attachment = array(
+                'post_mime_type' => $ft['type'],
+                'post_title'     => sanitize_text_field( $args['title'] ?? pathinfo( $filename, PATHINFO_FILENAME ) ),
+                'post_content'   => '',
+                'post_status'    => 'inherit',
+            );
+            $parent    = isset( $args['post_id'] ) ? absint( $args['post_id'] ) : 0;
+            $attach_id = wp_insert_attachment( $attachment, $file, $parent );
+            if ( is_wp_error( $attach_id ) ) {
+                return array( 'error' => $attach_id->get_error_message() );
+            }
+            $meta = wp_generate_attachment_metadata( $attach_id, $file );
+            wp_update_attachment_metadata( $attach_id, $meta );
+            if ( ! empty( $args['alt_text'] ) ) {
+                update_post_meta( $attach_id, '_wp_attachment_image_alt', sanitize_text_field( $args['alt_text'] ) );
+            }
+            return array(
+                'id'       => $attach_id,
+                'url'      => wp_get_attachment_url( $attach_id ),
+                'mime'     => $ft['type'],
+                'filename' => basename( $file ),
+                'bytes'    => strlen( $data ),
+            );
+        } );
 
         $this->register_tool( 'media_list', array(
             'description' => 'List media items with filtering by type, date, search',

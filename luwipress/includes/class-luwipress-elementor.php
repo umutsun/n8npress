@@ -131,14 +131,50 @@ class LuwiPress_Elementor {
             }
         }
 
+        // ── Attempt cap ────────────────────────────────────────────────────────
+        // Without a ceiling a failing (post, language) pair keeps being retried by
+        // whatever re-queues it, and every retry rewrote the live page. Give up
+        // loudly after N tries and leave a terminal status behind so the operator
+        // can see WHY the job stopped (tapadum, 2026-08-25).
+        $attempt_key = self::translation_attempt_meta_key( $target_language );
+        $attempts    = (int) get_post_meta( $source_id, $attempt_key, true );
+        $max_attempts = (int) apply_filters(
+            'luwipress_elementor_translation_max_attempts',
+            self::MAX_TRANSLATION_ATTEMPTS,
+            $source_id,
+            $target_language
+        );
+
+        if ( $attempts >= $max_attempts ) {
+            update_post_meta( $source_id, '_luwipress_translation_status', wp_json_encode( array(
+                'status'   => 'failed_max_attempts',
+                'language' => $target_language,
+                'attempts' => $attempts,
+                'error'    => sprintf( 'Gave up after %d attempts', $attempts ),
+                'finished' => current_time( 'mysql' ),
+            ) ) );
+            LuwiPress_Logger::log( sprintf(
+                'Cron: Elementor translation #%d → %s GIVEN UP after %d attempts. Clear %s to retry.',
+                $source_id, $target_language, $attempts, $attempt_key
+            ), 'error', array( 'post_id' => $source_id, 'language' => $target_language, 'attempts' => $attempts ) );
+            return;
+        }
+
+        $attempts++;
+        update_post_meta( $source_id, $attempt_key, $attempts );
+
         // Track translation status for progress polling
         update_post_meta( $source_id, '_luwipress_translation_status', wp_json_encode( array(
             'status'   => 'translating',
             'language' => $target_language,
+            'attempt'  => $attempts,
             'started'  => current_time( 'mysql' ),
         ) ) );
 
-        LuwiPress_Logger::log( 'Cron: translating Elementor page #' . $source_id . ' → ' . $target_language, 'info' );
+        LuwiPress_Logger::log( sprintf(
+            'Cron: translating Elementor page #%d → %s (attempt %d/%d)',
+            $source_id, $target_language, $attempts, $max_attempts
+        ), 'info' );
 
         try {
             $result = $this->translate_page( $source_id, $target_language );
@@ -150,32 +186,45 @@ class LuwiPress_Elementor {
             // Another run already holds the entry lock -- this duplicate cron job
             // is exactly what the lock exists to absorb. Not a failure: do not
             // write a terminal status (the active run owns completion; the
-            // 'translating' stamp above remains accurate while it runs).
+            // 'translating' stamp above remains accurate while it runs), and do not
+            // charge it an attempt -- no AI pass was made.
+            update_post_meta( $source_id, $attempt_key, $attempts - 1 );
             LuwiPress_Logger::log( 'Cron: translation of #' . $source_id . ' → ' . $target_language . ' already in progress -- duplicate job skipped', 'info' );
             return;
         }
 
         if ( is_wp_error( $result ) ) {
+            $exhausted = ( $attempts >= $max_attempts );
             update_post_meta( $source_id, '_luwipress_translation_status', wp_json_encode( array(
-                'status'   => 'failed',
+                'status'   => $exhausted ? 'failed_max_attempts' : 'failed',
                 'language' => $target_language,
+                'attempts' => $attempts,
+                'code'     => $result->get_error_code(),
                 'error'    => $result->get_error_message(),
                 'finished' => current_time( 'mysql' ),
             ) ) );
-            LuwiPress_Logger::log( 'Cron: Elementor translation FAILED #' . $source_id . ' → ' . $target_language . ': ' . $result->get_error_message(), 'error' );
+            LuwiPress_Logger::log( sprintf(
+                'Cron: Elementor translation FAILED #%d → %s (attempt %d/%d%s): %s',
+                $source_id, $target_language, $attempts, $max_attempts,
+                $exhausted ? ', giving up' : '', $result->get_error_message()
+            ), 'error', array( 'post_id' => $source_id, 'language' => $target_language, 'attempts' => $attempts ) );
         } else {
             // Verify translated post has a proper title and slug
             $tid = $result['translated_id'] ?? 0;
             if ( $tid ) {
                 $translated_post = get_post( $tid );
-                if ( $translated_post && ( empty( $translated_post->post_title ) || is_numeric( $translated_post->post_name ) ) ) {
+                if ( $translated_post && ( empty( $translated_post->post_title ) || self::slug_needs_repair( $translated_post->post_name ) ) ) {
                     $source = get_post( $source_id );
                     $fix = array( 'ID' => $tid );
                     if ( empty( $translated_post->post_title ) && $source ) {
                         $fix['post_title'] = $source->post_title;
                     }
-                    if ( is_numeric( $translated_post->post_name ) ) {
-                        $fix['post_name'] = sanitize_title( $translated_post->post_title ?: $source->post_title ) . '-' . $target_language;
+                    if ( self::slug_needs_repair( $translated_post->post_name ) ) {
+                        $slug_base = $translated_post->post_title;
+                        if ( '' === trim( (string) $slug_base ) && $source ) {
+                            $slug_base = $source->post_title;
+                        }
+                        $fix['post_name'] = sanitize_title( (string) $slug_base ) . '-' . $target_language;
                     }
                     wp_update_post( $fix );
                     LuwiPress_Logger::log( 'Cron: fixed missing title/slug on #' . $tid, 'warning' );
@@ -188,10 +237,15 @@ class LuwiPress_Elementor {
                 }
             }
 
+            // Success clears the attempt budget so a later legitimate re-run is not
+            // blocked by an old failure streak.
+            delete_post_meta( $source_id, $attempt_key );
+
             update_post_meta( $source_id, '_luwipress_translation_status', wp_json_encode( array(
                 'status'        => 'completed',
                 'language'      => $target_language,
                 'translated_id' => $tid,
+                'attempts'      => $attempts,
                 'finished'      => current_time( 'mysql' ),
             ) ) );
             LuwiPress_Logger::log( 'Cron: Elementor translation completed #' . $source_id . ' → #' . ( $tid ?: '?' ) . ' (' . $target_language . ')', 'info' );
@@ -225,26 +279,26 @@ class LuwiPress_Elementor {
         'elementskit-heading' => array( 'ekit_heading_title', 'ekit_heading_sub_title', 'ekit_heading_extra_title', 'ekit_heading_description' ),
         // LuwiPress Gold theme widgets (3.4.3+)
         'lwp-section-head'   => array( 'eyebrow', 'heading', 'cta_label' ),
-        'lwp-hero-split'     => array( 'eyebrow', 'kicker', 'heading', 'body', 'cta_label', 'quote', 'quote_name', 'quote_role' ),
+        'lwp-hero-split'     => array( 'eyebrow', 'kicker', 'heading', 'body', 'cta_label', 'quote', 'quote_name', 'quote_role', 'lead', 'cta1_label', 'cta2_label', 'pill_text', 'tag_eyebrow', 'tag_title', 'quote_initial', 'quote_text' ),
         'lwp-tour-hero'      => array( 'eyebrow', 'heading', 'sub', 'cta1_label', 'cta2_label', 'label_experience', 'label_date', 'label_guests' ),
         'lwp-story-split'    => array( 'card_eyebrow', 'card_title', 'card_sub', 'eyebrow', 'heading', 'lead', 'cta_label' ),
         'lwp-timeline'       => array( 'eyebrow', 'heading' ),
         'lwp-master-profile' => array( 'name', 'location', 'specialty', 'fallback_initial' ),
         'lwp-info-bar'       => array(),
-        'lwp-category-grid'  => array(),
-        'lwp-master-grid'    => array( 'eyebrow', 'heading' ),
-        'lwp-editorial-grid' => array( 'heading', 'eyebrow' ),
-        'lwp-newsletter'     => array( 'eyebrow', 'heading', 'sub', 'button_text', 'success_message' ),
+        'lwp-category-grid'  => array( 'count_label' ),
+        'lwp-master-grid'    => array( 'eyebrow', 'heading', 'view_all_label' ),
+        'lwp-editorial-grid' => array( 'heading', 'eyebrow', 'all_label' ),
+        'lwp-newsletter'     => array( 'eyebrow', 'heading', 'sub', 'button_text', 'success_message', 'lead', 'placeholder', 'btn_label', 'gdpr_text', 'success_msg', 'error_msg' ),
         'lwp-faq'            => array( 'eyebrow', 'heading' ),
-        'lwp-cta-banner'     => array( 'eyebrow', 'heading', 'body', 'button_text' ),
+        'lwp-cta-banner'     => array( 'eyebrow', 'heading', 'body', 'button_text', 'lead', 'cta1_label', 'cta2_label' ),
         'lwp-testimonials'   => array( 'eyebrow', 'heading' ),
-        'lwp-youtube-channel'=> array( 'eyebrow', 'heading', 'sub' ),
-        'lwp-instagram-channel' => array( 'eyebrow', 'heading', 'sub' ),
+        'lwp-youtube-channel'=> array( 'eyebrow', 'heading', 'sub', 'cta_label', 'subscribe_label' ),
+        'lwp-instagram-channel' => array( 'eyebrow', 'heading', 'sub', 'cta_label', 'follow_label' ),
         'lwp-process-steps'  => array( 'eyebrow', 'heading' ),
-        'lwp-featured-product' => array( 'eyebrow', 'heading', 'cta_label' ),
-        'lwp-featured-strip' => array(),
-        'lwp-countdown'      => array( 'heading', 'sub', 'cta_label' ),
-        'lwp-ai-search'      => array( 'placeholder', 'cta_label' ),
+        'lwp-featured-product' => array( 'eyebrow', 'heading', 'cta_label', 'c_title', 'c_excerpt', 'c_price' ),
+        'lwp-featured-strip' => array( 'eyebrow', 'heading' ),
+        'lwp-countdown'      => array( 'heading', 'sub', 'cta_label', 'lbl_days', 'lbl_hours', 'lbl_minutes', 'lbl_seconds', 'expired_msg', 'expired_btn' ),
+        'lwp-ai-search'      => array( 'placeholder', 'cta_label', 'badge' ),
         'lwp-megabar'        => array(),
         'lwp-stat-counter'   => array(),
         'lwp-trust-badges'   => array(),
@@ -293,6 +347,12 @@ class LuwiPress_Elementor {
         'lwp-product-grid'        => array( 'heading' ),
         // 1.10.3+ Contact CTA card (WhatsApp/Telegram auto-pulled from chat settings)
         'lwp-contact-cta'         => array( 'heading', 'lead', 'email', 'address_line', 'cta_label' ),
+        // 3.17.4 — widgets audited against the Gold theme control set
+        'lwp-cpt-grid' => array( 'meta_line_1', 'meta_line_2', 'view_all_label' ),
+        'lwp-hero' => array( 'eyebrow', 'headline', 'lead', 'cta_primary_label', 'cta_secondary_label', 'master_name', 'master_role' ),
+        'lwp-kg-stats' => array( 'eyebrow', 'heading', 'lbl_products', 'lbl_categories', 'lbl_authors', 'lbl_countries' ),
+        'lwp-kg-trending' => array( 'eyebrow', 'heading' ),
+        'lwp-taxonomy-terms' => array( 'count_label' ),
     );
 
     /**
@@ -306,30 +366,33 @@ class LuwiPress_Elementor {
         'price-table' => array( 'items_key' => 'features_list', 'fields' => array( 'item_text' ) ),
         // LuwiPress Gold theme widget repeaters (3.4.3+)
         'lwp-timeline'       => array( 'items_key' => 'rows',     'fields' => array( 'year', 'title', 'body' ) ),
-        'lwp-info-bar'       => array( 'items_key' => 'items',    'fields' => array( 'label', 'sub' ) ),
-        'lwp-category-grid'  => array( 'items_key' => 'items',    'fields' => array( 'title', 'sub_label' ) ),
+        'lwp-info-bar'       => array( 'items_key' => 'items', 'fields' => array( 'label', 'sub', 'title', 'desc' ) ),
+        'lwp-category-grid'  => array( 'items_key' => 'items', 'fields' => array( 'title', 'sub_label', 'eyebrow', 'sub' ) ),
         'lwp-master-grid'    => array( 'items_key' => 'items',    'fields' => array( 'name', 'location', 'specialty' ) ),
         'lwp-editorial-grid' => array( 'items_key' => 'items',    'fields' => array( 'title', 'eyebrow', 'excerpt' ) ),
         'lwp-hero-split'     => array( 'items_key' => 'stats',    'fields' => array( 'value', 'label' ) ),
         'lwp-section-head'   => array( 'items_key' => 'pills',    'fields' => array( 'label' ) ),
         'lwp-story-split'    => array( 'items_key' => 'bullets',  'fields' => array( 'title', 'body' ) ),
-        'lwp-faq'            => array( 'items_key' => 'items',    'fields' => array( 'question', 'answer' ) ),
-        'lwp-testimonials'   => array( 'items_key' => 'items',    'fields' => array( 'name', 'role', 'quote' ) ),
-        'lwp-process-steps'  => array( 'items_key' => 'steps',    'fields' => array( 'title', 'body' ) ),
-        'lwp-youtube-channel'=> array( 'items_key' => 'videos',   'fields' => array( 'title' ) ),
-        'lwp-instagram-channel' => array( 'items_key' => 'items', 'fields' => array( 'caption' ) ),
-        'lwp-trust-badges'   => array( 'items_key' => 'badges',   'fields' => array( 'label' ) ),
-        'lwp-stat-counter'   => array( 'items_key' => 'stats',    'fields' => array( 'label', 'suffix', 'prefix' ) ),
+        'lwp-faq'            => array( 'items_key' => 'items', 'fields' => array( 'question', 'answer', 'q', 'a' ) ),
+        'lwp-testimonials'   => array( 'items_key' => array( 'items', 'reviews' ), 'fields' => array( 'name', 'role', 'quote', 'location', 'product', 'date' ) ),
+        'lwp-process-steps'  => array( 'items_key' => array( 'steps', 'items' ), 'fields' => array( 'title', 'body' ) ),
+        'lwp-youtube-channel'=> array( 'items_key' => 'videos', 'fields' => array( 'title', 'byline', 'duration' ) ),
+        'lwp-instagram-channel' => array( 'items_key' => array( 'items', 'posts' ), 'fields' => array( 'caption', 'meta' ) ),
+        'lwp-trust-badges'   => array( 'items_key' => array( 'badges', 'items' ), 'fields' => array( 'label' ) ),
+        'lwp-stat-counter'   => array( 'items_key' => array( 'stats', 'items' ), 'fields' => array( 'label', 'suffix', 'prefix', 'sub' ) ),
         // 1.7.37 — header / footer chrome widgets
-        'lwp-topbar'         => array( 'items_key' => 'left_items',  'fields' => array( 'text' ) ),
+        'lwp-topbar'         => array( 'items_key' => 'left_items', 'fields' => array( 'text', 'label' ) ),
         'lwp-search-overlay' => array( 'items_key' => 'suggest_blocks', 'fields' => array( 'label', 'chips' ) ),
         'lwp-footer-column'  => array( 'items_key' => 'links',       'fields' => array( 'label' ) ),
         'lwp-footer-bottom'  => array( 'items_key' => 'legal_links', 'fields' => array( 'label' ) ),
         // 1.7.38 — shop / single-product widget repeaters
-        'lwp-shop-filters'   => array( 'items_key' => 'custom_blocks', 'fields' => array( 'heading' ) ),
+        'lwp-shop-filters'   => array( 'items_key' => 'custom_blocks', 'fields' => array( 'heading', 'label', 'count' ) ),
         'lwp-spec-list'      => array( 'items_key' => 'rows',          'fields' => array( 'label', 'value' ) ),
         'lwp-perks-list'     => array( 'items_key' => 'perks',         'fields' => array( 'strong', 'body' ) ),
         // 1.8.0 — none of the new widgets have translatable repeaters beyond their top-level fields
+        // 3.17.4 — widgets audited against the Gold theme control set
+        'lwp-ai-search' => array( 'items_key' => 'chips', 'fields' => array( 'label' ) ),
+        'lwp-hero' => array( 'items_key' => 'stats', 'fields' => array( 'label' ) ),
     );
 
     /**
@@ -433,6 +496,28 @@ class LuwiPress_Elementor {
             'methods'             => 'POST',
             'callback'            => array( $this, 'rest_queue_translations' ),
             'permission_callback' => array( 'LuwiPress_Permission', 'check_token_or_admin' ),
+        ) );
+
+        // Inspect the pending background translation queue
+        register_rest_route( $ns, '/elementor/translate-queue', array(
+            'methods'             => 'GET',
+            'callback'            => array( $this, 'rest_get_translation_queue' ),
+            'permission_callback' => array( 'LuwiPress_Permission', 'check_token_or_admin' ),
+            'args'                => array(
+                'post_id'  => array( 'sanitize_callback' => 'absint' ),
+                'language' => array( 'sanitize_callback' => 'sanitize_text_field' ),
+            ),
+        ) );
+
+        // Cancel ONE pending queue entry (post + language)
+        register_rest_route( $ns, '/elementor/translate-queue/cancel', array(
+            'methods'             => 'POST',
+            'callback'            => array( $this, 'rest_cancel_translation_queue_entry' ),
+            'permission_callback' => array( 'LuwiPress_Permission', 'check_token_or_admin' ),
+            'args'                => array(
+                'post_id'  => array( 'required' => true, 'sanitize_callback' => 'absint' ),
+                'language' => array( 'required' => true, 'sanitize_callback' => 'sanitize_text_field' ),
+            ),
         ) );
 
         register_rest_route( $ns, '/elementor/widget', array(
@@ -971,6 +1056,166 @@ class LuwiPress_Elementor {
 
     /* ──────────────────────── WRITE Operations ──────────────────────── */
 
+    /** Separator for indexed repeater paths: "items:0:title". */
+    const REPEATER_PATH_SEPARATOR = ':';
+
+    /**
+     * Sanitize a widget setting value of ANY shape.
+     *
+     * wp_kses_post() is a string-only sanitizer. Feeding it a repeater array or a
+     * link-control object flattens the value (or fatals inside the CSS rebuild that
+     * follows the save) and the caller gets a broken response body instead of an
+     * error -- tapadum, 2026-08-25. Arrays are walked recursively so structured
+     * controls survive intact; anything we cannot represent is refused loudly.
+     *
+     * @param mixed $value Raw value from the caller.
+     * @param int   $depth Recursion guard.
+     * @return mixed|WP_Error Sanitized value, or WP_Error for unsupported types.
+     */
+    public static function sanitize_setting_value( $value, $depth = 0 ) {
+        if ( $depth > 12 ) {
+            return new WP_Error( 'value_too_deep', 'Setting value nested deeper than 12 levels', array( 'status' => 400 ) );
+        }
+        if ( null === $value ) {
+            return '';
+        }
+        if ( is_bool( $value ) || is_int( $value ) || is_float( $value ) ) {
+            return $value;
+        }
+        if ( is_string( $value ) ) {
+            return wp_kses_post( $value );
+        }
+        if ( is_array( $value ) ) {
+            $clean = array();
+            foreach ( $value as $key => $item ) {
+                $safe_key  = is_int( $key ) ? $key : sanitize_text_field( (string) $key );
+                $safe_item = self::sanitize_setting_value( $item, $depth + 1 );
+                if ( is_wp_error( $safe_item ) ) {
+                    return $safe_item;
+                }
+                $clean[ $safe_key ] = $safe_item;
+            }
+            return $clean;
+        }
+        return new WP_Error(
+            'unsupported_value_type',
+            sprintf( 'Setting value of type "%s" cannot be written; pass a string, number, or array.', gettype( $value ) ),
+            array( 'status' => 400 )
+        );
+    }
+
+    /**
+     * Write ONE field into a widget's settings array.
+     *
+     * Shared by set_widget_text() and bulk_update() so both entry points behave
+     * identically. Three behaviours the old inline write got wrong:
+     *
+     *  1. "items:0:title" paths now land in the repeater row instead of creating a
+     *     flat junk key the renderer never reads.
+     *  2. A bare string aimed at a link control ({url, is_external, nofollow})
+     *     fills the url key instead of replacing the object -- the old behaviour
+     *     silently deleted the rendered button and could not be undone with the
+     *     same tool, only via snapshot rollback.
+     *  3. A bare string aimed at any other structured control is refused rather
+     *     than accepted-then-broken.
+     *
+     * @param array  $settings Widget settings, modified in place.
+     * @param string $field    Field key, optionally an "items:index:field" path.
+     * @param mixed  $value    New value.
+     * @return true|WP_Error
+     */
+    public static function apply_widget_setting( array &$settings, $field, $value ) {
+        $field = (string) $field;
+
+        // ── Indexed repeater path: items:0:title ──
+        if ( false !== strpos( $field, self::REPEATER_PATH_SEPARATOR ) ) {
+            $parts = explode( self::REPEATER_PATH_SEPARATOR, $field, 3 );
+            if ( count( $parts ) < 3 ) {
+                return new WP_Error(
+                    'invalid_field_path',
+                    sprintf( 'Field path "%s" must be "repeater_key:index:sub_field".', $field ),
+                    array( 'status' => 400 )
+                );
+            }
+            list( $items_key, $index, $sub_field ) = $parts;
+            $items_key = sanitize_text_field( $items_key );
+            $sub_field = sanitize_text_field( $sub_field );
+            $index     = (int) $index;
+
+            if ( ! isset( $settings[ $items_key ] ) || ! is_array( $settings[ $items_key ] )
+                || ! isset( $settings[ $items_key ][ $index ] ) || ! is_array( $settings[ $items_key ][ $index ] ) ) {
+                return new WP_Error(
+                    'repeater_index_missing',
+                    sprintf( 'Repeater "%s" has no row %d on this widget; read the widget first.', $items_key, $index ),
+                    array( 'status' => 404 )
+                );
+            }
+
+            $clean = self::sanitize_setting_value( $value );
+            if ( is_wp_error( $clean ) ) {
+                return $clean;
+            }
+            $settings[ $items_key ][ $index ][ $sub_field ] = $clean;
+            return true;
+        }
+
+        $key      = sanitize_text_field( $field );
+        $existing = isset( $settings[ $key ] ) ? $settings[ $key ] : null;
+
+        $clean = self::sanitize_setting_value( $value );
+        if ( is_wp_error( $clean ) ) {
+            return $clean;
+        }
+
+        // ── Shape guard: never downgrade a structured control to a bare scalar ──
+        if ( is_array( $existing ) && ! is_array( $clean ) ) {
+            if ( array_key_exists( 'url', $existing ) ) {
+                $existing['url']  = is_scalar( $clean ) ? (string) $clean : '';
+                $settings[ $key ] = $existing;
+                return true;
+            }
+            return new WP_Error(
+                'shape_mismatch',
+                sprintf( 'Field "%s" holds a structured control; pass an array of the same shape, not a bare value.', $key ),
+                array( 'status' => 400 )
+            );
+        }
+
+        $settings[ $key ] = $clean;
+        return true;
+    }
+
+    /**
+     * Apply a map of field => value to one widget, collecting per-field errors.
+     *
+     * Atomic per widget: the batch is staged on a copy and only committed when every
+     * field succeeds. A half-applied widget is worse than a refused one -- the caller
+     * cannot tell which fields landed, and a mixed-shape settings array can take the
+     * renderer down.
+     *
+     * @param array $settings   Widget settings, replaced in place on success.
+     * @param array $new_values field => value.
+     * @return array List of ['field' => ..., 'code' => ..., 'message' => ...] failures.
+     */
+    public static function apply_widget_settings( array &$settings, array $new_values ) {
+        $working = $settings;
+        $errors  = array();
+        foreach ( $new_values as $field => $value ) {
+            $result = self::apply_widget_setting( $working, $field, $value );
+            if ( is_wp_error( $result ) ) {
+                $errors[] = array(
+                    'field'   => (string) $field,
+                    'code'    => $result->get_error_code(),
+                    'message' => $result->get_error_message(),
+                );
+            }
+        }
+        if ( empty( $errors ) ) {
+            $settings = $working;
+        }
+        return $errors;
+    }
+
     /**
      * Update text in a specific widget.
      *
@@ -985,20 +1230,35 @@ class LuwiPress_Elementor {
             return $data;
         }
 
-        $found = false;
-        $data  = $this->walk_elements_modify( $data, function ( &$element ) use ( $widget_id, $new_texts, &$found ) {
+        $found  = false;
+        $errors = array();
+        $data   = $this->walk_elements_modify( $data, function ( &$element ) use ( $widget_id, $new_texts, &$found, &$errors ) {
             if ( ( $element['id'] ?? '' ) !== $widget_id ) {
                 return;
             }
             $found = true;
 
-            foreach ( $new_texts as $field => $value ) {
-                $element['settings'][ sanitize_text_field( $field ) ] = wp_kses_post( $value );
+            if ( ! isset( $element['settings'] ) || ! is_array( $element['settings'] ) ) {
+                $element['settings'] = array();
             }
+            $errors = self::apply_widget_settings( $element['settings'], $new_texts );
         } );
 
         if ( ! $found ) {
             return new WP_Error( 'widget_not_found', 'Widget ID not found: ' . $widget_id, array( 'status' => 404 ) );
+        }
+
+        // All-or-nothing: a half-applied write leaves the widget in a shape the
+        // renderer may not survive, and the caller cannot tell which fields landed.
+        if ( ! empty( $errors ) ) {
+            return new WP_Error(
+                'setting_write_rejected',
+                sprintf(
+                    '%d of %d field(s) rejected on widget %s; nothing was written. First: %s',
+                    count( $errors ), count( $new_texts ), $widget_id, $errors[0]['message']
+                ),
+                array( 'status' => 400, 'errors' => $errors )
+            );
         }
 
         return $this->save_elementor_data( $post_id, $data );
@@ -1077,10 +1337,12 @@ class LuwiPress_Elementor {
             $change = $change_map[ $wid ];
 
             // Apply text changes
+            $text_errors = array();
             if ( ! empty( $change['texts'] ) && is_array( $change['texts'] ) ) {
-                foreach ( $change['texts'] as $field => $value ) {
-                    $element['settings'][ sanitize_text_field( $field ) ] = wp_kses_post( $value );
+                if ( ! isset( $element['settings'] ) || ! is_array( $element['settings'] ) ) {
+                    $element['settings'] = array();
                 }
+                $text_errors = self::apply_widget_settings( $element['settings'], $change['texts'] );
             }
 
             // Apply style changes (CSS-friendly or Elementor-native)
@@ -1093,7 +1355,11 @@ class LuwiPress_Elementor {
                 }
             }
 
-            $results[ $wid ] = 'updated';
+            // Per-widget reporting: a rejected field must be visible in the response
+            // instead of surfacing as a broken JSON body (tapadum 2026-08-25).
+            $results[ $wid ] = empty( $text_errors )
+                ? 'updated'
+                : array( 'status' => 'rejected', 'errors' => $text_errors );
         } );
 
         // Check for missing widgets
@@ -1112,6 +1378,165 @@ class LuwiPress_Elementor {
     }
 
     /* ──────────────────── TRANSLATE Operation ────────────────────────── */
+
+    /** Default share of attempted strings that must come back before we write. */
+    const MIN_TRANSLATION_COVERAGE = 0.8;
+
+    /** Max background attempts per (post, language) before the job is given up on. */
+    const MAX_TRANSLATION_ATTEMPTS = 3;
+
+    /**
+     * Does a translation post's slug need rebuilding?
+     *
+     * Both broken shapes matter: WordPress falls back to the post ID for an
+     * untitled post (numeric slug), and a translation created before its title
+     * existed can be saved with NO slug at all. The old check only tested
+     * is_numeric(), and is_numeric('') is false — so empty-slug siblings were
+     * never repaired and their permalinks bounced (tapadum finding 6b).
+     *
+     * @param string $post_name Current slug.
+     * @return bool
+     */
+    public static function slug_needs_repair( $post_name ) {
+        $post_name = trim( (string) $post_name );
+        return '' === $post_name || is_numeric( $post_name );
+    }
+
+    /**
+     * Meta key holding the background attempt count for one target language.
+     *
+     * @param string $language Target language code.
+     * @return string
+     */
+    public static function translation_attempt_meta_key( $language ) {
+        return '_luwipress_translation_attempts_' . sanitize_key( $language );
+    }
+
+    /**
+     * Share of attempted strings the AI actually returned (0.0 - 1.0).
+     *
+     * The old code treated "at least one string came back" as success and then wrote
+     * a source-language clone over the live translation. Measuring coverage is what
+     * lets save_translated_page() refuse a mostly-failed pass.
+     *
+     * @param array $attempted List of ['widget_id' => ..., 'field' => ...].
+     * @param array $trans_map widget_id => [field => translated text].
+     * @return float
+     */
+    public static function translation_coverage( array $attempted, array $trans_map ) {
+        $total = count( $attempted );
+        if ( $total < 1 ) {
+            return 0.0;
+        }
+        $hits = 0;
+        foreach ( $attempted as $item ) {
+            $wid   = $item['widget_id'] ?? '';
+            $field = $item['field'] ?? '';
+            if ( '' === $wid || '' === $field ) {
+                continue;
+            }
+            if ( isset( $trans_map[ $wid ][ $field ] ) && '' !== (string) $trans_map[ $wid ][ $field ] ) {
+                $hits++;
+            }
+        }
+        return round( $hits / $total, 4 );
+    }
+
+    /**
+     * Flatten an Elementor element tree into element_id => settings.
+     *
+     * @param array $elements Decoded _elementor_data.
+     * @return array
+     */
+    public static function collect_widget_settings( array $elements ) {
+        $map  = array();
+        $walk = function ( $nodes ) use ( &$walk, &$map ) {
+            foreach ( $nodes as $node ) {
+                if ( ! is_array( $node ) ) {
+                    continue;
+                }
+                $id = $node['id'] ?? '';
+                if ( '' !== $id && isset( $node['settings'] ) && is_array( $node['settings'] ) ) {
+                    $map[ $id ] = $node['settings'];
+                }
+                if ( ! empty( $node['elements'] ) && is_array( $node['elements'] ) ) {
+                    $walk( $node['elements'] );
+                }
+            }
+        };
+        $walk( $elements );
+        return $map;
+    }
+
+    /**
+     * Pick the value to write for one translatable field.
+     *
+     * Order matters: a fresh translation wins; otherwise whatever the target page
+     * already shows is kept (that is either an earlier good translation or an
+     * operator's hand fix -- both were being overwritten with source text); only a
+     * genuinely empty target falls back to the source string.
+     *
+     * @param string $widget_id    Element ID.
+     * @param string $field        Setting key.
+     * @param array  $trans_map    Fresh translations.
+     * @param array  $existing_map Current target-page settings (element_id => settings).
+     * @param mixed  $source_value Value on the source page.
+     * @return mixed
+     */
+    public static function resolve_translated_value( $widget_id, $field, array $trans_map, array $existing_map, $source_value ) {
+        if ( isset( $trans_map[ $widget_id ][ $field ] ) && '' !== (string) $trans_map[ $widget_id ][ $field ] ) {
+            return $trans_map[ $widget_id ][ $field ];
+        }
+        if ( isset( $existing_map[ $widget_id ][ $field ] ) ) {
+            $previous = $existing_map[ $widget_id ][ $field ];
+            $has_value = is_array( $previous ) ? ! empty( $previous ) : ( '' !== trim( (string) $previous ) );
+            if ( $has_value ) {
+                return $previous;
+            }
+        }
+        return $source_value;
+    }
+
+    /**
+     * Read pending wp_cron events for one hook out of a cron array.
+     *
+     * The Elementor translation queue lives in the `cron` option and was reachable
+     * from no endpoint at all, so operators could neither see nor cancel a pending
+     * job (tapadum finding 2).
+     *
+     * @param array  $cron_array Result of _get_cron_array().
+     * @param string $hook       Hook name to filter on.
+     * @return array List of ['post_id' => int, 'language' => string, 'timestamp' => int].
+     */
+    public static function parse_cron_queue( array $cron_array, $hook ) {
+        $entries = array();
+        foreach ( $cron_array as $timestamp => $hooks ) {
+            // The cron option carries a non-numeric 'version' key alongside timestamps.
+            if ( ! is_int( $timestamp ) || ! is_array( $hooks ) ) {
+                continue;
+            }
+            if ( ! isset( $hooks[ $hook ] ) || ! is_array( $hooks[ $hook ] ) ) {
+                continue;
+            }
+            foreach ( $hooks[ $hook ] as $event ) {
+                $args = ( is_array( $event ) && isset( $event['args'] ) && is_array( $event['args'] ) )
+                    ? array_values( $event['args'] )
+                    : array();
+                if ( count( $args ) < 2 ) {
+                    continue;
+                }
+                $entries[] = array(
+                    'post_id'   => (int) $args[0],
+                    'language'  => (string) $args[1],
+                    'timestamp' => (int) $timestamp,
+                );
+            }
+        }
+        usort( $entries, function ( $a, $b ) {
+            return $a['timestamp'] <=> $b['timestamp'];
+        } );
+        return $entries;
+    }
 
     /**
      * Translate all Elementor page content to a target language.
@@ -1455,46 +1880,139 @@ class LuwiPress_Elementor {
             return new WP_Error( 'translation_failed', 'All AI translation calls failed — reverted to pre-translation state', array( 'status' => 500 ) );
         }
 
-        // Apply translations to a copy of the Elementor data
-        $translated_data = $this->walk_elements_modify( $data, function ( &$element ) use ( $trans_map ) {
+        // ── Coverage gate ──────────────────────────────────────────────────────
+        // Everything below writes a SOURCE-derived tree over the target page. When
+        // most chunks failed, that tree is mostly source language: publishing it
+        // replaces a good translation (and any operator hand-fixes) with English.
+        // tapadum, 2026-08-25: one page oscillated DE -> EN -> EN across reruns
+        // because "at least one string came back" counted as success.
+        $attempted = array_merge( $texts_for_ai, $long_texts );
+        $coverage  = self::translation_coverage( $attempted, $trans_map );
+
+        $existing_target_id = $this->find_translation_id( $post_id, $target_language );
+        $existing_map       = $this->existing_translation_texts( $existing_target_id );
+
+        $min_coverage = (float) apply_filters(
+            'luwipress_elementor_translation_min_coverage',
+            self::MIN_TRANSLATION_COVERAGE,
+            $post_id,
+            $target_language
+        );
+
+        if ( $coverage < $min_coverage && ! empty( $existing_map ) ) {
+            // Deliberately NOT reverting the source here: nothing was written, and
+            // wp_restore_post_revision() would bump the source's post_modified, which
+            // marks every language's translation "outdated" on a refusal we expect to
+            // happen routinely. Just drop the revision pointer this run created.
+            delete_post_meta( $post_id, '_luwipress_pre_translation_revision' );
+            LuwiPress_Logger::log( sprintf(
+                'Elementor translate #%d -> %s REFUSED: only %.0f%% of %d strings came back (min %.0f%%). Existing translation #%d left untouched — rerun to fill the gaps.',
+                $post_id, $target_language, $coverage * 100, count( $attempted ), $min_coverage * 100, $existing_target_id
+            ), 'error', array(
+                'post_id'       => $post_id,
+                'language'      => $target_language,
+                'coverage'      => $coverage,
+                'translated_id' => $existing_target_id,
+            ) );
+            return new WP_Error(
+                'partial_translation_refused',
+                sprintf(
+                    'Only %.0f%% of %d strings were translated (minimum %.0f%%). Existing translation #%d was NOT overwritten.',
+                    $coverage * 100, count( $attempted ), $min_coverage * 100, $existing_target_id
+                ),
+                array( 'status' => 409, 'coverage' => $coverage, 'translated_id' => $existing_target_id )
+            );
+        }
+
+        if ( $coverage < 1.0 ) {
+            LuwiPress_Logger::log( sprintf(
+                'Elementor translate #%d -> %s: coverage %.0f%% (%d strings). Untranslated fields keep the target page\'s current value.',
+                $post_id, $target_language, $coverage * 100, count( $attempted )
+            ), 'warning', array( 'post_id' => $post_id, 'language' => $target_language, 'coverage' => $coverage ) );
+        }
+
+        // Fields we tried to translate, grouped per widget — the resolution set.
+        $attempted_by_widget = array();
+        foreach ( $attempted as $item ) {
+            $wid = (string) $item['widget_id'];
+            $fld = (string) $item['field'];
+            if ( '' !== $wid && '' !== $fld ) {
+                $attempted_by_widget[ $wid ][] = $fld;
+            }
+        }
+
+        // Apply translations to a copy of the Elementor data. Structure comes from
+        // the source (structural sync is intended); text is resolved per field so a
+        // failed string keeps whatever the target already shows instead of reverting
+        // to source language.
+        $translated_data = $this->walk_elements_modify( $data, function ( &$element ) use ( $trans_map, $existing_map, $attempted_by_widget ) {
             $wid = $element['id'] ?? '';
-            if ( ! isset( $trans_map[ $wid ] ) ) {
+            if ( '' === $wid ) {
                 return;
             }
 
-            $widget_type = $element['widgetType'] ?? '';
+            $fields = $attempted_by_widget[ $wid ] ?? array();
+            foreach ( array_keys( (array) ( $trans_map[ $wid ] ?? array() ) ) as $translated_field ) {
+                if ( ! in_array( $translated_field, $fields, true ) ) {
+                    $fields[] = $translated_field;
+                }
+            }
+            if ( empty( $fields ) ) {
+                return;
+            }
 
-            foreach ( $trans_map[ $wid ] as $field => $translated_text ) {
+            foreach ( $fields as $field ) {
                 // Handle repeater items (tabs, accordion, etc.)
                 if ( strpos( $field, ':' ) !== false ) {
                     list( $items_key, $index, $sub_field ) = explode( ':', $field, 3 );
                     $index = intval( $index );
-                    if ( isset( $element['settings'][ $items_key ][ $index ] ) ) {
-                        $element['settings'][ $items_key ][ $index ][ $sub_field ] = $translated_text;
+                    if ( ! isset( $element['settings'][ $items_key ][ $index ][ $sub_field ] ) ) {
+                        continue;
                     }
+                    $element['settings'][ $items_key ][ $index ][ $sub_field ] = self::resolve_translated_value(
+                        $wid, $field, $trans_map, $existing_map,
+                        $element['settings'][ $items_key ][ $index ][ $sub_field ]
+                    );
                 } else {
-                    $element['settings'][ $field ] = $translated_text;
+                    $element['settings'][ $field ] = self::resolve_translated_value(
+                        $wid, $field, $trans_map, $existing_map,
+                        $element['settings'][ $field ] ?? ''
+                    );
                 }
             }
         } );
 
-        // Extract translated title from widget texts (for post_title update)
+        // ── Page title ─────────────────────────────────────────────────────────
+        // Translate the REAL post title. The old code scavenged the first widget
+        // carrying a 'title'-ish field, but 'title' exists on counters, CTAs and
+        // image boxes too, and $trans_map has no meaningful order — so a button
+        // label could become the page title (and therefore the slug): the Discounts
+        // page came out titled "MEHR ANSEHEN" (tapadum, 2026-08-25). Widget
+        // scavenging is now only a fallback for genuinely untitled pages, and only
+        // from heading widgets.
         $translated_title = '';
-        $title_fields = array( 'title', 'ekit_heading_title', 'heading_title' );
-        foreach ( $trans_map as $wid => $fields ) {
-            foreach ( $title_fields as $tf ) {
-                if ( ! empty( $fields[ $tf ] ) ) {
-                    $translated_title = strip_tags( $fields[ $tf ] );
-                    break 2;
+        $source_post      = get_post( $post_id );
+
+        if ( ! $source_post || '' === trim( (string) $source_post->post_title ) ) {
+            $heading_types = array( 'heading', 'elementskit-heading', 'lwp-section-head' );
+            $title_fields  = array( 'title', 'ekit_heading_title', 'heading_title', 'heading' );
+            foreach ( $trans_map as $wid => $fields ) {
+                if ( ! in_array( $translatable[ $wid ]['type'] ?? '', $heading_types, true ) ) {
+                    continue;
+                }
+                foreach ( $title_fields as $tf ) {
+                    if ( ! empty( $fields[ $tf ] ) ) {
+                        $translated_title = strip_tags( $fields[ $tf ] );
+                        break 2;
+                    }
                 }
             }
         }
 
-        // Fallback: if no widget title found, translate the source post title via AI
-        $source_post = get_post( $post_id );
         if ( empty( $translated_title ) && $source_post && ! empty( $source_post->post_title ) ) {
             $ai_title = LuwiPress_AI_Engine::dispatch( 'title-translation', LuwiPress_AI_Engine::build_messages( array(
-                'system' => 'You are a translator. Return ONLY the translated text, nothing else.',
+                'system' => 'You are a translator. Return ONLY the translated text, nothing else.'
+                    . LuwiPress_Translation::glossary_prompt_rule(),
                 'user'   => sprintf( 'Translate this title from %s to %s: "%s"',
                     $source_name, $target_name, $source_post->post_title ),
             ) ), array( 'max_tokens' => 256 ) );
@@ -1629,6 +2147,142 @@ class LuwiPress_Elementor {
         }
 
         return rest_ensure_response( $this->translate_page( $post_id, $target_language ) );
+    }
+
+    /**
+     * Pending luwipress_elementor_translate_single events, oldest first.
+     *
+     * @return array List of ['post_id' => int, 'language' => string, 'timestamp' => int].
+     */
+    private function pending_translation_events() {
+        $cron = _get_cron_array();
+        return self::parse_cron_queue( $cron ? $cron : array(), 'luwipress_elementor_translate_single' );
+    }
+
+    /**
+     * List pending background translation jobs, enriched with per-post state.
+     *
+     * The queue lives in wp_cron; translation_status only counts the standard
+     * (non-Elementor) path's meta, so Elementor jobs were invisible everywhere
+     * (tapadum finding 2).
+     *
+     * @param int    $filter_post_id  Optional post filter (0 = all).
+     * @param string $filter_language Optional language filter ('' = all).
+     * @return array
+     */
+    public function list_translation_queue( $filter_post_id = 0, $filter_language = '' ) {
+        $pending = $this->pending_translation_events();
+
+        $max_attempts = (int) apply_filters(
+            'luwipress_elementor_translation_max_attempts',
+            self::MAX_TRANSLATION_ATTEMPTS,
+            0,
+            ''
+        );
+
+        $now     = time();
+        $entries = array();
+        foreach ( $pending as $entry ) {
+            if ( $filter_post_id && $entry['post_id'] !== $filter_post_id ) {
+                continue;
+            }
+            if ( '' !== $filter_language && $entry['language'] !== $filter_language ) {
+                continue;
+            }
+
+            $status_raw = get_post_meta( $entry['post_id'], '_luwipress_translation_status', true );
+            $status     = is_string( $status_raw ) ? json_decode( $status_raw, true ) : null;
+            $attempts   = (int) get_post_meta( $entry['post_id'], self::translation_attempt_meta_key( $entry['language'] ), true );
+
+            $entries[] = array(
+                'post_id'      => $entry['post_id'],
+                'title'        => get_the_title( $entry['post_id'] ),
+                'language'     => $entry['language'],
+                'scheduled_at' => gmdate( 'c', $entry['timestamp'] ),
+                'due_in'       => $entry['timestamp'] - $now,
+                'overdue'      => $entry['timestamp'] <= $now,
+                'attempts'     => $attempts,
+                'max_attempts' => $max_attempts,
+                'phase'        => is_array( $status ) ? ( $status['status'] ?? 'queued' ) : 'queued',
+                'last_status'  => is_array( $status ) ? $status : null,
+            );
+        }
+
+        return array(
+            'pending'      => count( $entries ),
+            'cron_running' => ! ( defined( 'DISABLE_WP_CRON' ) && DISABLE_WP_CRON ),
+            'entries'      => $entries,
+        );
+    }
+
+    /**
+     * Cancel every pending queue entry for one (post, language) pair.
+     *
+     * @param int    $post_id  Source post ID.
+     * @param string $language Target language code.
+     * @return array
+     */
+    public function cancel_translation_queue_entry( $post_id, $language ) {
+        $post_id  = absint( $post_id );
+        $language = sanitize_text_field( $language );
+
+        $pending = $this->pending_translation_events();
+
+        $removed = 0;
+        foreach ( $pending as $entry ) {
+            if ( $entry['post_id'] !== $post_id || $entry['language'] !== $language ) {
+                continue;
+            }
+            wp_unschedule_event( $entry['timestamp'], 'luwipress_elementor_translate_single', array( $post_id, $language ) );
+            $removed++;
+        }
+
+        // Belt: clears any event whose args differ only by type coercion.
+        wp_clear_scheduled_hook( 'luwipress_elementor_translate_single', array( $post_id, $language ) );
+
+        if ( $removed ) {
+            update_post_meta( $post_id, '_luwipress_translation_status', wp_json_encode( array(
+                'status'   => 'cancelled',
+                'language' => $language,
+                'finished' => current_time( 'mysql' ),
+            ) ) );
+        }
+
+        LuwiPress_Logger::log( sprintf(
+            'Elementor translate queue: %d job(s) cancelled for #%d → %s',
+            $removed, $post_id, $language
+        ), 'info', array( 'post_id' => $post_id, 'language' => $language ) );
+
+        return array(
+            'status'   => $removed ? 'cancelled' : 'not_queued',
+            'post_id'  => $post_id,
+            'language' => $language,
+            'removed'  => $removed,
+        );
+    }
+
+    /**
+     * GET /elementor/translate-queue
+     */
+    public function rest_get_translation_queue( $request ) {
+        return rest_ensure_response( $this->list_translation_queue(
+            absint( $request->get_param( 'post_id' ) ),
+            sanitize_text_field( (string) $request->get_param( 'language' ) )
+        ) );
+    }
+
+    /**
+     * POST /elementor/translate-queue/cancel
+     */
+    public function rest_cancel_translation_queue_entry( $request ) {
+        $post_id  = absint( $request->get_param( 'post_id' ) );
+        $language = sanitize_text_field( (string) $request->get_param( 'language' ) );
+
+        if ( ! $post_id || '' === $language ) {
+            return new WP_Error( 'missing_params', 'post_id and language are required', array( 'status' => 400 ) );
+        }
+
+        return rest_ensure_response( $this->cancel_translation_queue_entry( $post_id, $language ) );
     }
 
     /**
@@ -3296,17 +3950,42 @@ class LuwiPress_Elementor {
 
         // Repeater items
         if ( isset( self::REPEATER_WIDGETS[ $widget_type ] ) ) {
-            $config    = self::REPEATER_WIDGETS[ $widget_type ];
-            $items_key = $config['items_key'];
-            $sub_fields = $config['fields'];
+            $texts += self::extract_repeater_texts( $settings, self::REPEATER_WIDGETS[ $widget_type ] );
+        }
 
-            if ( ! empty( $settings[ $items_key ] ) && is_array( $settings[ $items_key ] ) ) {
-                foreach ( $settings[ $items_key ] as $idx => $item ) {
-                    foreach ( $sub_fields as $sf ) {
-                        if ( ! empty( $item[ $sf ] ) ) {
-                            // Use colon-separated key: items_key:index:field
-                            $texts[ $items_key . ':' . $idx . ':' . $sf ] = $item[ $sf ];
-                        }
+        return $texts;
+    }
+
+    /**
+     * Pull translatable strings out of a widget's repeater rows.
+     *
+     * `items_key` accepts a string OR a list of candidate keys, because theme
+     * widgets rename their repeater over time (process-steps: steps -> items,
+     * testimonials: items -> reviews). A single hard-coded key meant those
+     * sections silently stayed in the source language after a theme update —
+     * the extractor found nothing and the translator was never asked
+     * (tapadum finding 6c, 2026-08-25). Unknown keys simply do not match.
+     *
+     * @param array $settings Widget settings.
+     * @param array $config   ['items_key' => string|string[], 'fields' => string[]].
+     * @return array field-path => text, keyed as "items_key:index:sub_field".
+     */
+    public static function extract_repeater_texts( array $settings, array $config ) {
+        $texts      = array();
+        $sub_fields = isset( $config['fields'] ) ? (array) $config['fields'] : array();
+
+        foreach ( (array) ( $config['items_key'] ?? array() ) as $items_key ) {
+            if ( empty( $settings[ $items_key ] ) || ! is_array( $settings[ $items_key ] ) ) {
+                continue;
+            }
+            foreach ( $settings[ $items_key ] as $idx => $item ) {
+                if ( ! is_array( $item ) ) {
+                    continue;
+                }
+                foreach ( $sub_fields as $sf ) {
+                    if ( ! empty( $item[ $sf ] ) && is_scalar( $item[ $sf ] ) ) {
+                        // Colon-separated path: items_key:index:field
+                        $texts[ $items_key . ':' . $idx . ':' . $sf ] = $item[ $sf ];
                     }
                 }
             }
@@ -3623,6 +4302,11 @@ class LuwiPress_Elementor {
         delete_post_meta( $post_id, '_elementor_css' );
         delete_post_meta( $post_id, '_elementor_page_assets' );
 
+        // Elementor 3.2x+ also caches RENDERED element markup. Clearing only the CSS
+        // meta leaves the old HTML being served, so a correct _elementor_data write
+        // looks like it silently reverted on the frontend.
+        delete_post_meta( $post_id, '_elementor_element_cache' );
+
         // If Elementor plugin is active, use its API to clear CSS
         if ( class_exists( '\Elementor\Plugin' ) ) {
             try {
@@ -3678,6 +4362,9 @@ RULES:
             $target_name
         );
 
+        // Brand/product names the operator marked as untranslatable.
+        $system .= LuwiPress_Translation::glossary_prompt_rule();
+
         $texts_json = wp_json_encode( $texts_for_ai, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT );
 
         $user = sprintf(
@@ -3699,6 +4386,79 @@ IMPORTANT: Return exactly the same number of items. Keep widget_id and field val
             'system' => $system,
             'user'   => $user,
         ), $texts_for_ai, $source_name, $target_name );
+    }
+
+    /**
+     * Resolve the existing translation post for a (source, language) pair.
+     *
+     * WPML's object_id filter is unreliable in cron context, so the direct
+     * icl_translations lookup is kept as a fallback (same pairing the save path
+     * has always used — extracted so the coverage gate can consult it BEFORE
+     * anything is written).
+     *
+     * @param int    $source_id Source post ID.
+     * @param string $language  Target language code.
+     * @return int Translation post ID, or 0 when none exists.
+     */
+    public function find_translation_id( $source_id, $language ) {
+        $source_id = absint( $source_id );
+        if ( ! $source_id || ! defined( 'ICL_SITEPRESS_VERSION' ) ) {
+            return 0;
+        }
+        $source_post = get_post( $source_id );
+        if ( ! $source_post ) {
+            return 0;
+        }
+
+        $element_type = 'post_' . $source_post->post_type;
+        $trid         = apply_filters( 'wpml_element_trid', null, $source_id, $element_type );
+        if ( ! $trid ) {
+            return 0;
+        }
+
+        $default_lang = LuwiPress_Translation::get_default_language();
+        do_action( 'wpml_switch_language', $language );
+        $translated_id = apply_filters( 'wpml_object_id', $source_id, $source_post->post_type, false, $language );
+        do_action( 'wpml_switch_language', $default_lang );
+
+        if ( ! $translated_id || absint( $translated_id ) === $source_id ) {
+            global $wpdb;
+            $translated_id = $wpdb->get_var( $wpdb->prepare(
+                "SELECT element_id FROM {$wpdb->prefix}icl_translations
+                 WHERE trid = %d AND language_code = %s AND element_id != %d",
+                $trid, $language, $source_id
+            ) );
+        }
+
+        $translated_id = absint( $translated_id );
+        return ( $translated_id && $translated_id !== $source_id ) ? $translated_id : 0;
+    }
+
+    /**
+     * Current translatable texts on an existing translation post.
+     *
+     * Uses the same extraction (and therefore the same field-key vocabulary,
+     * repeater paths included) as the source side, so resolve_translated_value()
+     * can compare them field by field.
+     *
+     * @param int $translated_id Translation post ID (0 = none).
+     * @return array element_id => [field => value]
+     */
+    private function existing_translation_texts( $translated_id ) {
+        if ( ! $translated_id ) {
+            return array();
+        }
+        $extracted = $this->extract_translatable_text( $translated_id );
+        if ( is_wp_error( $extracted ) || ! is_array( $extracted ) ) {
+            return array();
+        }
+        $map = array();
+        foreach ( $extracted as $wid => $info ) {
+            if ( isset( $info['texts'] ) && is_array( $info['texts'] ) ) {
+                $map[ $wid ] = $info['texts'];
+            }
+        }
+        return $map;
     }
 
     /**
@@ -3878,21 +4638,8 @@ IMPORTANT: Return exactly the same number of items. Keep widget_id and field val
             return $this->save_translated_page_standalone( $source_id, $language, $translated_data );
         }
 
-        // Check for existing translation — switch WPML context to find it
-        do_action( 'wpml_switch_language', $language );
-        $translated_id = apply_filters( 'wpml_object_id', $source_id, $post_type, false, $language );
-        do_action( 'wpml_switch_language', $default_lang );
-
-        // Also try direct DB lookup (WPML filter sometimes fails in cron context)
-        if ( ! $translated_id || $translated_id === $source_id ) {
-            global $wpdb;
-            $translated_id = $wpdb->get_var( $wpdb->prepare(
-                "SELECT element_id FROM {$wpdb->prefix}icl_translations
-                 WHERE trid = %d AND language_code = %s AND element_id != %d",
-                $trid, $language, $source_id
-            ) );
-            $translated_id = $translated_id ? absint( $translated_id ) : null;
-        }
+        // Check for existing translation (WPML context switch + direct DB fallback)
+        $translated_id = $this->find_translation_id( $source_id, $language );
 
         $translated_json = wp_json_encode( $translated_data );
 
@@ -5283,23 +6030,61 @@ IMPORTANT: Return exactly the same number of items. Keep widget_id and field val
         // contract as save_elementor_data().
         update_post_meta( $post_id, $meta_key, wp_slash( $decoded ) );
 
+        // ── Read-back verification ─────────────────────────────────────────────
+        // update_post_meta() returns false on a rejected write (oversized payload
+        // hitting max_allowed_packet, a filter veto, an unchanged value) and the old
+        // code neither checked it nor re-read the row — it reported "written" plus
+        // the sha of what it MEANT to store. A silently dropped write then looked
+        // like the value had reverted on its own (tapadum, 2026-08-25).
+        wp_cache_delete( $post_id, 'post_meta' );
+        $stored     = (string) get_post_meta( $post_id, $meta_key, true );
+        $want_sha   = substr( hash( 'sha256', $decoded ), 0, 16 );
+        $stored_sha = substr( hash( 'sha256', $stored ), 0, 16 );
+        $verified   = ( $stored_sha === $want_sha );
+
+        if ( ! $verified ) {
+            LuwiPress_Logger::log( sprintf(
+                'Elementor: raw post_meta write for post #%d key=%s NOT VERIFIED — wanted %d bytes (%s), stored %d bytes (%s). Prior value preserved at %s.',
+                $post_id, $meta_key, strlen( $decoded ), $want_sha, strlen( $stored ), $stored_sha, $backup_key
+            ), 'error', array( 'post_id' => $post_id, 'meta_key' => $meta_key ) );
+
+            return new WP_Error(
+                'write_not_verified',
+                sprintf(
+                    'Write did not land: expected %d bytes (sha %s) but the row holds %d bytes (sha %s). Nothing was changed; prior value is backed up at %s.',
+                    strlen( $decoded ), $want_sha, strlen( $stored ), $stored_sha, $backup_key
+                ),
+                array(
+                    'status'         => 500,
+                    'post_id'        => $post_id,
+                    'meta_key'       => $meta_key,
+                    'expected_sha16' => $want_sha,
+                    'stored_sha16'   => $stored_sha,
+                    'backup_key'     => $backup_key,
+                )
+            );
+        }
+
         // For _elementor_data writes, regenerate Elementor CSS + purge page cache.
+        // Only after the bytes are confirmed on disk — regenerating around a failed
+        // write just republishes the stale render.
         if ( $meta_key === '_elementor_data' ) {
             $this->regenerate_css( $post_id );
             $this->purge_page_cache_for_post( $post_id );
         }
 
         LuwiPress_Logger::log( sprintf(
-            'Elementor: raw post_meta written for post #%d key=%s len=%d backup=%s',
+            'Elementor: raw post_meta written for post #%d key=%s len=%d backup=%s (verified)',
             $post_id, $meta_key, strlen( $decoded ), $backup_key
         ), 'warning' );
 
         return array(
             'status'      => 'written',
+            'verified'    => true,
             'post_id'     => $post_id,
             'meta_key'    => $meta_key,
-            'bytes'       => strlen( $decoded ),
-            'sha256_16'   => substr( hash( 'sha256', $decoded ), 0, 16 ),
+            'bytes'       => strlen( $stored ),
+            'sha256_16'   => $stored_sha,
             'backup_key'  => $backup_key,
         );
     }

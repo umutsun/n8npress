@@ -119,6 +119,12 @@ foreach ( $files as $file ) {
 		$skipped++;
 		continue;
 	}
+	// Skip editor / backup artifacts — never ship .bak / .orig / .tmp / ~
+	// files (e.g. elementor-kit/*.json.pre1737.bak rollback copies).
+	if ( preg_match( '/\.(bak|orig|tmp)$/i', $rel ) || substr( $rel, -1 ) === '~' ) {
+		$skipped++;
+		continue;
+	}
 	// Skip Claude design prompt + screenshot scaffolding (dev-only).
 	if ( in_array( $rel, array( 'CLAUDE-DESIGN-PROMPT.md', 'CLAUDE-DESIGN-PROMPT-SHORT.md', 'SCREENSHOT.md' ), true ) ) {
 		$skipped++;

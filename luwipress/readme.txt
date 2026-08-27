@@ -4,7 +4,7 @@ Tags: woocommerce, ai, seo, translation, automation, product enrichment, multili
 Requires at least: 5.6
 Tested up to: 7.0
 Requires PHP: 7.4
-Stable tag: 3.17.3
+Stable tag: 3.17.4
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -129,6 +129,21 @@ Set a daily budget limit in Settings → AI API Keys. When reached, all AI featu
 6. Activity log with workflow results
 
 == Changelog ==
+
+= 3.17.4 — Translations stop overwriting themselves =
+* **A half-finished translation can no longer replace a finished one.** When the AI service returned only part of a page, the pipeline still published the result — and because the untranslated parts fall back to the original language, a fully translated page could be pushed back to English, taking any manual corrections with it. A page is now only republished when enough of it actually came back; otherwise the live translation is left exactly as it was and the run is reported as refused.
+* **Wording you already fixed by hand survives a re-run.** Fields the translator could not deliver now keep whatever the translated page currently shows, instead of reverting to the source language.
+* **Background translations give up instead of looping.** A failing page is retried a limited number of times and then stops with a recorded reason, rather than being retried indefinitely — each retry used to rewrite the live page.
+* **You can finally see and stop the translation queue.** Pending background translations are listed with their language, when they are due and how many attempts they have used, and a single page/language job can be cancelled on its own instead of clearing the whole queue. The translation status view now shows this queue too.
+* **The page editor accepts structured content.** Tabs, accordions, bullet lists and link fields can now be written directly (as a whole list, or one row at a time); previously these requests failed with an unreadable error.
+* **Link fields can no longer be emptied by accident.** Writing plain text into a button's link now sets the address instead of destroying the field — which used to make the button disappear from the page with no way to undo it from the editor.
+* **Direct content writes are verified.** A write that does not reach the database is now reported as failed instead of being confirmed, and the rendered-content cache is cleared so corrected pages actually appear updated.
+* **Translation requests now tell you when a language failed.** The response reports each language's outcome (completed / rejected / failed) with a reason, instead of always answering "completed" and leaving the rejection only in the log.
+* **Pages with no translatable text no longer fail silently.** A request against a page whose visible copy comes entirely from a dynamic grid is answered with an explicit "nothing to translate" instead of appearing to vanish.
+* **Protected terms (glossary).** Brand and product names you list are reproduced verbatim in every language, so "Tapadum Music Store" no longer becomes "Tapadum Musikladen" — and, because titles and slugs are derived from translated copy, the URLs stop drifting too.
+* **Page titles are translated from the actual page title**, not scavenged from whichever widget happened to come first — a button reading "MEHR ANSEHEN" could previously become the page's title and slug.
+* **Translations born without a URL slug are repaired.** The slug check missed empty slugs entirely, so those pages kept a broken permalink.
+* **Many more theme fields are translated.** Section leads, stat labels, countdown labels, newsletter and FAQ copy, testimonials, info bars and several other blocks were silently skipped because the field map had drifted from the theme; the map has been audited against the shipped widgets and now tolerates renamed fields.
 
 = 3.17.3 — Knowledge Graph for every site, not just shops =
 * **The Knowledge Graph now works on sites without WooCommerce.** Stores were never the only thing worth mapping: directories, portfolios, real-estate listings and any other custom catalogue now appear in the graph with the same Catalog / Posts / Pages views, health scoring and one-click actions. Nothing to configure — the graph detects what your site actually publishes.

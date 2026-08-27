@@ -4,7 +4,7 @@ Tags: mcp, ai, automation, claude, anthropic, woocommerce, rest-api
 Requires at least: 5.6
 Tested up to: 7.0
 Requires PHP: 7.4
-Stable tag: 1.0.48
+Stable tag: 1.0.51
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -57,6 +57,21 @@ No. Tools delegate to LuwiPress core classes (AI Engine, Translation, Elementor,
 Bearer token via `Authorization: Bearer <token>` header or a logged-in WordPress admin session. The token is the same one configured in LuwiPress → Settings → Connection.
 
 == Changelog ==
+
+= 1.0.51 — See and cancel the Elementor translation queue (paired with core 3.17.4) =
+* **New: `elementor_translation_queue`** — lists the PENDING background page-translation jobs that `translation_status` cannot see (it only counts the standard, non-Elementor path). Each entry reports the post, language, when it is due, attempts used against the cap, and the last recorded phase.
+* **New: `elementor_translation_queue_cancel`** — cancels the queued job for ONE page/language pair, leaving every other queued job alone. Previously the only option was clearing the entire queue.
+* **`elementor_set_widget_text` / `elementor_bulk_update` accept structured values.** Whole repeater arrays (tabs, lists, stats), link objects, and indexed `"tabs:0:tab_title"` paths now write correctly instead of failing with an unreadable response. Writes are atomic per widget: if a field is rejected nothing is written and the response names the field.
+* **Plain text aimed at a link control now fills its address** rather than replacing the control and removing the element from the page.
+* **`post_meta_raw_set` verifies the write.** It re-reads the stored bytes and returns the ACTUAL checksum; a write that did not land is now an error instead of a success report.
+* **`elementor_retranslate_from_source` clears the attempt counter**, so a page that exhausted its automatic retries can still be requeued on request.
+* **`translation_request` reports per-language outcomes.** The response now carries `completed`, `failed` and a `results` map with a reason per language, instead of a flat `completed` that hid rejections. A page with no translatable text answers `skipped`, and an Elementor page with no translatable widgets says so at queue time.
+* **`translation_settings` accepts `translation_glossary`** — the list of brand/product terms the translator must reproduce verbatim.
+
+= 1.0.49 – 1.0.50 — Backup, forms and store tools =
+* **Backup bridge tools** — `backup_status`, `backup_list`, `backup_run`, `backup_restore`, `backup_pull`, `backup_rescan`, `backup_diag` for driving the detected backup plugin.
+* **Forms tools** — `forms_list`, `forms_get`, `forms_create`, `forms_update`, `forms_entries`.
+* **Store tools** — `product_update`, `store_visibility_set`, `wc_manual_payment_set`.
 
 = 1.0.48 — Theme string translation tools (paired with core 3.15.0) =
 * **New: `theme_translation_coverage`** — per-locale translated/missing counts for the active theme's UI strings.

@@ -327,6 +327,64 @@ class LuwiPress_Translation {
     /**
      * GET /translation/settings â€” mirrors the Translation tab in Settings.
      */
+    /** Hard cap so a runaway glossary cannot crowd out the content in a prompt. */
+    const MAX_PROTECTED_TERMS = 200;
+
+    /**
+     * Terms the translator must reproduce verbatim (brand names, product lines).
+     *
+     * "Preserve brand names" as a prose instruction is not enough: models happily
+     * rendered "Tapadum Music Store" as "Tapadum Musikladen", and because the page
+     * title and slug are derived from translated copy, the mistranslation
+     * propagated into the URL (tapadum, 2026-08-25). An explicit list is
+     * enforceable in a way an adjective is not.
+     *
+     * Accepts a newline- or comma-separated string, or an array.
+     *
+     * @return string[]
+     */
+    public static function get_protected_terms() {
+        $raw = get_option( 'luwipress_translation_glossary', '' );
+
+        if ( ! is_array( $raw ) ) {
+            $raw = preg_split( '/[\r\n,]+/', (string) $raw );
+        }
+
+        $terms = array();
+        foreach ( (array) $raw as $term ) {
+            if ( ! is_scalar( $term ) ) {
+                continue;
+            }
+            $term = trim( sanitize_text_field( (string) $term ) );
+            if ( '' !== $term && ! in_array( $term, $terms, true ) ) {
+                $terms[] = $term;
+            }
+        }
+
+        $terms = array_slice( $terms, 0, self::MAX_PROTECTED_TERMS );
+
+        /**
+         * Filter the protected-term glossary.
+         *
+         * @param string[] $terms Terms that must never be translated.
+         */
+        return (array) apply_filters( 'luwipress_translation_protected_terms', $terms );
+    }
+
+    /**
+     * Prompt fragment enforcing the glossary. Empty string when none is configured.
+     *
+     * @return string
+     */
+    public static function glossary_prompt_rule() {
+        $terms = self::get_protected_terms();
+        if ( empty( $terms ) ) {
+            return '';
+        }
+        return "\n- NEVER translate these terms — reproduce them character for character, including when they appear inside a longer sentence, a heading, or a title: "
+            . implode( ' | ', $terms );
+    }
+
     public function handle_get_settings( $request ) {
         return array(
             'target_language'       => (string) get_option( 'luwipress_target_language', 'en' ),
@@ -334,6 +392,7 @@ class LuwiPress_Translation {
             'hreflang_mode'         => (string) get_option( 'luwipress_hreflang_mode', 'auto' ),
             'translation_engine'    => (string) get_option( 'luwipress_translation_engine', 'ai' ),
             // The DeepL key itself is never exposed — only whether one is usable.
+            'translation_glossary'  => self::get_protected_terms(),
             'deepl_configured'      => class_exists( 'LuwiPress_DeepL' ) && LuwiPress_DeepL::is_configured(),
         );
     }
@@ -378,6 +437,19 @@ class LuwiPress_Translation {
             }
             update_option( 'luwipress_translation_engine', $engine );
             $updated[] = 'translation_engine';
+        }
+
+        if ( array_key_exists( 'translation_glossary', $data ) ) {
+            $glossary = $data['translation_glossary'];
+            if ( ! is_array( $glossary ) ) {
+                $glossary = preg_split( '/[
+,]+/', (string) $glossary );
+            }
+            $glossary = array_values( array_filter( array_map( function ( $t ) {
+                return trim( sanitize_text_field( (string) $t ) );
+            }, (array) $glossary ) ) );
+            update_option( 'luwipress_translation_glossary', array_slice( $glossary, 0, self::MAX_PROTECTED_TERMS ) );
+            $updated[] = 'translation_glossary';
         }
 
         LuwiPress_Logger::log( 'Translation settings updated via REST: ' . implode( ', ', $updated ), 'info' );
@@ -772,6 +844,13 @@ class LuwiPress_Translation {
         }
 
         if ( $is_elementor_page ) {
+            // Tell the caller UP FRONT when the page carries no translatable widget
+            // text (pure dynamic CPT-grid pages). The background job then produces a
+            // structure-only sibling and no text ever changes -- which, without this,
+            // looks exactly like the request having vanished (tapadum finding 4).
+            $elementor_texts = LuwiPress_Elementor::get_instance()->extract_translatable_text( $product_id );
+            $has_widget_text = ! is_wp_error( $elementor_texts ) && ! empty( $elementor_texts );
+
             foreach ( $target_languages as $lang ) {
                 update_post_meta( $product_id, '_luwipress_translation_status', wp_json_encode( array(
                     'status'   => 'queued',
@@ -781,14 +860,53 @@ class LuwiPress_Translation {
                 wp_schedule_single_event( time(), 'luwipress_elementor_translate_single', array( $product_id, $lang ) );
             }
             spawn_cron();
-            LuwiPress_Logger::log( 'Elementor page #' . $product_id . ' queued for background translation â†’ ' . implode( ',', $target_languages ), 'info' );
+            LuwiPress_Logger::log( sprintf(
+                'Elementor page #%d queued for background translation → %s (%s)',
+                $product_id, implode( ',', $target_languages ),
+                $has_widget_text ? count( $elementor_texts ) . ' translatable widget(s)' : 'NO translatable widget text — structure-only sibling will be created'
+            ), $has_widget_text ? 'info' : 'warning', array( 'post_id' => $product_id ) );
+
             return rest_ensure_response( array(
-                'status'      => 'queued',
-                'post_id'     => $product_id,
-                'languages'   => $target_languages,
-                'message'     => 'Elementor page queued for background translation',
+                'status'             => 'queued',
+                'post_id'            => $product_id,
+                'languages'          => $target_languages,
+                'translatable_widgets' => $has_widget_text ? count( $elementor_texts ) : 0,
+                'message'            => $has_widget_text
+                    ? 'Elementor page queued for background translation'
+                    : 'Queued, but this page has NO translatable widget text (dynamic/shortcode-only). A structure-only translation will be created so the language pair exists; no text will change.',
             ) );
         }
+
+        // A page whose visible copy comes entirely from a dynamic grid/shortcode has
+        // nothing for the translator to work on. The engine used to run anyway and
+        // produce no sibling and no log line, so repeated requests looked like they
+        // vanished (tapadum finding 4, 2026-08-25). Say so instead.
+        $source_text_len = mb_strlen( trim( wp_strip_all_tags(
+            (string) ( $payload['content']['description'] ?? '' ) . ' ' .
+            (string) ( $payload['content']['short_description'] ?? '' )
+        ) ) );
+        if ( $source_text_len < 20 ) {
+            foreach ( $target_languages as $lang ) {
+                update_post_meta( $product_id, '_luwipress_translation_' . $lang . '_status', 'skipped_no_content' );
+            }
+            LuwiPress_Logger::log( sprintf(
+                'Translation skipped for post #%d (%s): source has %d chars of translatable body — nothing to translate (dynamic/shortcode-only page).',
+                $product_id, implode( ',', $target_languages ), $source_text_len
+            ), 'warning', array( 'post_id' => $product_id, 'languages' => $target_languages ) );
+
+            return rest_ensure_response( array(
+                'status'           => 'skipped',
+                'reason'           => 'no_translatable_content',
+                'message'          => sprintf( 'Source post #%d has %d characters of translatable body text. Nothing was created.', $product_id, $source_text_len ),
+                'post_id'          => $product_id,
+                'product_id'       => $product_id,
+                'target_languages' => $target_languages,
+            ) );
+        }
+
+        // Per-language outcome, so a rejection reaches the caller instead of only
+        // the system log (tapadum finding 3, 2026-08-25).
+        $results = array();
 
         foreach ( $target_languages as $lang ) {
             update_post_meta( $product_id, '_luwipress_translation_' . $lang . '_status', 'processing' );
@@ -889,6 +1007,11 @@ class LuwiPress_Translation {
                         // corrupted IT copies on tapadum.com, 2026-04-20). Fail the translation
                         // and preserve existing content untouched.
                         update_post_meta( $product_id, '_luwipress_translation_' . $lang . '_status', 'failed' );
+                        $results[ $lang ] = array(
+                            'status' => 'rejected',
+                            'reason' => 'unparseable_ai_response',
+                            'detail' => sprintf( 'AI response could not be parsed as JSON (raw length %d). Existing content preserved.', strlen( $raw_text ) ),
+                        );
                         LuwiPress_Logger::log(
                             'Translation JSON parse failed for ' . $lang . ' (product #' . $product_id . '): raw response could not be parsed, translation rejected to protect existing content. raw_len=' . strlen( $raw_text ),
                             'error',
@@ -901,6 +1024,11 @@ class LuwiPress_Translation {
 
             if ( is_wp_error( $ai_result ) ) {
                 update_post_meta( $product_id, '_luwipress_translation_' . $lang . '_status', 'failed' );
+                $results[ $lang ] = array(
+                    'status' => 'failed',
+                    'reason' => $ai_result->get_error_code(),
+                    'detail' => $ai_result->get_error_message(),
+                );
                 LuwiPress_Logger::log( 'Translation failed for ' . $lang . ': ' . $ai_result->get_error_message(), 'error', array( 'product_id' => $product_id ) );
                 continue;
             }
@@ -922,12 +1050,19 @@ class LuwiPress_Translation {
             $tr_desc_len  = strlen( (string) ( $ai_result['description'] ?? '' ) );
             if ( $src_desc_len > 500 && $tr_desc_len < max( 200, (int) ( $src_desc_len * 0.2 ) ) ) {
                 update_post_meta( $product_id, '_luwipress_translation_' . $lang . '_status', 'failed' );
+                $results[ $lang ] = array(
+                    'status' => 'rejected',
+                    'reason' => 'empty_or_truncated_translation',
+                    'detail' => sprintf( 'Translated body was %d chars against a %d-char source. Existing content preserved; re-run to retry.', $tr_desc_len, $src_desc_len ),
+                );
                 LuwiPress_Logger::log( sprintf(
                     'Translation rejected for %s (post #%d): translated body %d chars vs source %d -- empty/truncated AI output, existing content preserved.',
                     $lang, $product_id, $tr_desc_len, $src_desc_len
                 ), 'error', array( 'product_id' => $product_id, 'language' => $lang ) );
                 continue;
             }
+
+            $results[ $lang ] = array( 'status' => 'completed' );
 
             $callback_request = new WP_REST_Request( 'POST', '/luwipress/v1/translation/callback' );
             $callback_request->set_body_params( array(
@@ -948,17 +1083,43 @@ class LuwiPress_Translation {
             $this->handle_translation_callback( $callback_request );
         }
 
-        LuwiPress_Logger::log( 'Translation requested for: ' . ( $product ? $product->get_name() : $post->post_title ), 'info', array(
+        // Overall status reflects what actually happened. Returning a flat
+        // "completed" while a language was rejected made failures invisible to the
+        // caller -- they only showed up in system_logs (tapadum finding 3).
+        $completed = array_keys( array_filter( $results, static function ( $r ) {
+            return 'completed' === $r['status'];
+        } ) );
+        $failed = array_diff( $target_languages, $completed );
+
+        if ( empty( $completed ) ) {
+            $overall = 'rejected';
+        } elseif ( empty( $failed ) ) {
+            $overall = 'completed';
+        } else {
+            $overall = 'partial';
+        }
+
+        LuwiPress_Logger::log( sprintf(
+            'Translation requested for: %s — %d/%d language(s) completed%s',
+            ( $product ? $product->get_name() : $post->post_title ),
+            count( $completed ), count( $target_languages ),
+            empty( $failed ) ? '' : ' (failed: ' . implode( ',', $failed ) . ')'
+        ), empty( $failed ) ? 'info' : 'warning', array(
             'product_id'      => $product_id,
             'source_post_id'  => $source_post_id,
             'source_language' => $source_language,
             'languages'       => $target_languages,
+            'results'         => $results,
         ) );
 
         return rest_ensure_response( array(
-            'status'           => 'completed',
+            'status'           => $overall,
             'product_id'       => $product_id,
+            'post_id'          => $product_id,
             'target_languages' => $target_languages,
+            'completed'        => array_values( $completed ),
+            'failed'           => array_values( $failed ),
+            'results'          => $results,
         ) );
     }
 
@@ -1287,9 +1448,20 @@ class LuwiPress_Translation {
             ];
         }
 
+        // Elementor pages run on a wp_cron queue and stamp a DIFFERENT meta key
+        // (_luwipress_translation_status, no language segment), so the counts above
+        // structurally cannot see them — "processing: 0" while jobs were waiting was
+        // a correct answer from the wrong table (tapadum, 2026-08-25). Surface the
+        // background queue here too, next to the counts operators actually check.
+        $elementor_queue = array( 'pending' => 0, 'entries' => array() );
+        if ( class_exists( 'LuwiPress_Elementor' ) ) {
+            $elementor_queue = LuwiPress_Elementor::get_instance()->list_translation_queue();
+        }
+
         return rest_ensure_response([
             'translation_plugin' => $this->detect_translation_plugin(),
             'languages'          => $stats,
+            'elementor_queue'    => $elementor_queue,
         ]);
     }
 
@@ -4099,7 +4271,7 @@ class LuwiPress_Translation {
                AND t.language_code != %%s
                AND p.post_type IN (%s)
                AND p.post_status IN ('publish','draft','private')
-               AND (p.post_title = '' OR p.post_name REGEXP '^[0-9]+$')
+               AND (p.post_title = '' OR p.post_name = '' OR p.post_name REGEXP '^[0-9]+$')
              LIMIT 100",
             $type_ph
         );
@@ -4136,8 +4308,8 @@ class LuwiPress_Translation {
                 wp_update_post( array( 'ID' => $row->ID, 'post_title' => $source->post_title ) );
             }
 
-            // Fix 2: If slug numeric, generate from current title
-            if ( is_numeric( $row->post_name ) ) {
+            // Fix 2: If slug is numeric OR empty, generate from current title
+            if ( LuwiPress_Elementor::slug_needs_repair( $row->post_name ) ) {
                 $title_for_slug = ! empty( $row->post_title ) ? $row->post_title : $source->post_title;
                 wp_update_post( array( 'ID' => $row->ID, 'post_name' => sanitize_title( $title_for_slug ) . '-' . $row->language_code ) );
             }

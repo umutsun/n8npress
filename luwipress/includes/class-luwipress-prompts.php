@@ -553,6 +553,9 @@ RULES:
 			$target_lang
 		);
 
+		// Brand/product names the operator marked as untranslatable.
+		$system .= LuwiPress_Translation::glossary_prompt_rule();
+
 		$user = sprintf(
 			'Product ID: %1$d
 Target Language: %2$s
@@ -605,6 +608,8 @@ RULES:
 			$source_lang,
 			$target_lang
 		);
+
+		$system .= LuwiPress_Translation::glossary_prompt_rule();
 
 		$user = $html_chunk;
 
