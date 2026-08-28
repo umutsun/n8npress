@@ -6305,7 +6305,7 @@ class LuwiPress_WebMCP {
 
         // FR 4 — find-replace MCP wrapper (REST already exists)
         $this->register_tool( 'elementor_replace_text', array(
-            'description' => 'Bulk text find-replace across one or many Elementor pages. Supports dry_run mode (preview which widgets would change), regex mode, scope=text|styles|both. Mirrors POST /elementor/find-replace REST endpoint. Snapshots are NOT taken automatically — caller should run elementor_snapshot first if rollback may be needed.',
+            'description' => 'Bulk text find-replace across one or many Elementor pages. Supports dry_run mode (preview which widgets would change), regex mode, scope=text|styles|both|links|all. Mirrors POST /elementor/find-replace REST endpoint. Snapshots are NOT taken automatically — caller should run elementor_snapshot first if rollback may be needed.',
             'inputSchema' => array(
                 'type'       => 'object',
                 'properties' => array(
@@ -6313,7 +6313,7 @@ class LuwiPress_WebMCP {
                     'post_type' => array( 'type' => 'string', 'description' => 'Post type filter (alternative to post_ids — scans all posts of this type)' ),
                     'find'      => array( 'type' => 'string', 'description' => 'Text or regex pattern to find (required)' ),
                     'replace'   => array( 'type' => 'string', 'description' => 'Replacement text (required, can be empty string)' ),
-                    'scope'     => array( 'type' => 'string', 'enum' => array( 'text', 'styles', 'both' ), 'description' => 'Where to search — default "text"' ),
+                    'scope'     => array( 'type' => 'string', 'enum' => array( 'text', 'styles', 'both', 'links', 'all' ), 'description' => 'Where to search: "text" (widget copy, default) · "styles" (scalar style settings) · "both" (text+styles) · "links" (link control URLs only — these are arrays and are invisible to every other scope) · "all" (text+styles+links). Use "links" or "all" to repoint source-language URLs left behind in translated pages.' ),
                     'is_regex'  => array( 'type' => 'boolean', 'description' => 'If true, find is interpreted as regex pattern' ),
                     'dry_run'   => array( 'type' => 'boolean', 'description' => 'If true, preview without saving' ),
                     'style_key' => array( 'type' => 'string', 'description' => 'When scope=styles, limit to a specific style key' ),
@@ -9394,7 +9394,7 @@ class LuwiPress_WebMCP {
         } );
 
         $this->register_tool( 'meta_set', array(
-            'description' => 'Set a custom field value for a post/product',
+            'description' => 'Set a custom field value for a post/product. HTML is preserved at wp_kses_post level (it used to be stripped by sanitize_text_field). Structural JSON meta owned by other subsystems — _elementor_data, _elementor_page_settings, _elementor_controls_usage — is REFUSED here: writing it through this tool destroyed all markup. Use elementor_set_widget_text / elementor_bulk_update, or post_meta_raw_set for a verified raw write.',
             'inputSchema' => array(
                 'type'       => 'object',
                 'properties' => array(
@@ -9411,12 +9411,28 @@ class LuwiPress_WebMCP {
                 throw new Exception( 'Post not found' );
             }
             $key = sanitize_text_field( $args['key'] );
-            update_post_meta( $post_id, $key, sanitize_text_field( $args['value'] ) );
+
+            // Structural JSON owned by other subsystems. sanitize_text_field() below
+            // flattens every tag, so an _elementor_data write through here silently
+            // stripped <p>/<strong>/<a href> out of every widget on the page
+            // (tapadum, 2026-08-28). Refuse loudly and name the right tool.
+            $structural = array( '_elementor_data', '_elementor_page_settings', '_elementor_controls_usage' );
+            if ( in_array( $key, $structural, true ) ) {
+                throw new Exception( sprintf(
+                    'Refusing to write "%s" through meta_set — this tool sanitizes values as plain text and would strip all HTML from the page. Use elementor_set_widget_text / elementor_bulk_update for field edits, or post_meta_raw_set (confirm_token + read-back verification) for a raw write.',
+                    $key
+                ) );
+            }
+
+            // wp_kses_post, not sanitize_text_field: meta legitimately carries markup
+            // (descriptions, notes), and stripping it made this path inconsistent with
+            // every other write tool. Still XSS-safe.
+            update_post_meta( $post_id, $key, wp_kses_post( (string) $args['value'] ) );
             return array( 'post_id' => $post_id, 'key' => $key, 'updated' => true );
         } );
 
         $this->register_tool( 'meta_set_bulk', array(
-            'description' => 'Set MANY custom fields on ONE post/product in a single call — the bulk form of meta_set. Pass { "post_id": N, "meta": { "key1": "v1", "key2": "v2", … } }. Ideal for filling a CPT field schema (10-16 fields) in one round-trip instead of N sequential meta_set calls. Values are stored as strings. Structured-array keys (_luwipress_faq / _luwipress_howto / _luwipress_speakable) are skipped — use aeo_save_faq / aeo_save_schema for those.',
+            'description' => 'Set MANY custom fields on ONE post/product in a single call — the bulk form of meta_set. Pass { "post_id": N, "meta": { "key1": "v1", "key2": "v2", … } }. Ideal for filling a CPT field schema (10-16 fields) in one round-trip instead of N sequential meta_set calls. Values are stored as strings with HTML preserved at wp_kses_post level. Structured-array keys (_luwipress_faq / _luwipress_howto / _luwipress_speakable) are skipped — use aeo_save_faq / aeo_save_schema for those. Elementor JSON keys (_elementor_data and friends) are skipped too — use the elementor_* tools or post_meta_raw_set.',
             'inputSchema' => array(
                 'type'       => 'object',
                 'properties' => array(
@@ -9436,6 +9452,8 @@ class LuwiPress_WebMCP {
                 throw new Exception( 'meta must be a non-empty object of { key: value } pairs.' );
             }
             $structured_keys = array( '_luwipress_faq', '_luwipress_howto', '_luwipress_speakable' );
+            // Same trap as meta_set: plain-text sanitizing structural JSON destroys it.
+            $structural_keys = array( '_elementor_data', '_elementor_page_settings', '_elementor_controls_usage' );
             $set     = array();
             $skipped = array();
             foreach ( $meta as $k => $v ) {
@@ -9447,7 +9465,11 @@ class LuwiPress_WebMCP {
                     $skipped[] = $key; // structured array — use aeo_save_faq / aeo_save_schema.
                     continue;
                 }
-                update_post_meta( $post_id, $key, sanitize_text_field( (string) $v ) );
+                if ( in_array( $key, $structural_keys, true ) ) {
+                    $skipped[] = $key; // Elementor JSON — use the elementor_* tools.
+                    continue;
+                }
+                update_post_meta( $post_id, $key, wp_kses_post( (string) $v ) );
                 $set[] = $key;
             }
             return array( 'post_id' => $post_id, 'set' => $set, 'count' => count( $set ), 'skipped' => $skipped );

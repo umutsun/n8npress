@@ -138,4 +138,69 @@ class ElementorSettingWriteTest extends TestCase {
 		$this->assertSame( 'repeater_index_missing', $result->get_error_code() );
 		$this->assertArrayNotHasKey( 'bullets', $settings );
 	}
+
+	/* ── 2026-08-28 report #1: nested path into an object control ── */
+
+	public function test_two_part_path_writes_into_an_object_control(): void {
+		// "all_link:url" — the shape the operator actually reached for. Before, a
+		// 2-segment path was rejected outright (and on 3.17.3 it created a flat
+		// junk key the renderer ignores).
+		$settings = array( 'all_link' => array( 'url' => '/journal', 'is_external' => '', 'nofollow' => '' ) );
+
+		$result = \LuwiPress_Elementor::apply_widget_setting( $settings, 'all_link:url', 'https://tapadum.com/it/blog/' );
+
+		$this->assertTrue( $result );
+		$this->assertSame(
+			array( 'url' => 'https://tapadum.com/it/blog/', 'is_external' => '', 'nofollow' => '' ),
+			$settings['all_link']
+		);
+		$this->assertArrayNotHasKey( 'all_link:url', $settings );
+	}
+
+	public function test_two_part_path_can_add_a_key_to_an_existing_object_control(): void {
+		$settings = array( 'cta_url' => array( 'url' => '/x/' ) );
+
+		$this->assertTrue( \LuwiPress_Elementor::apply_widget_setting( $settings, 'cta_url:nofollow', 'on' ) );
+		$this->assertSame( array( 'url' => '/x/', 'nofollow' => 'on' ), $settings['cta_url'] );
+	}
+
+	public function test_two_part_path_on_a_scalar_field_is_refused(): void {
+		$settings = array( 'heading' => 'Titel' );
+
+		$result = \LuwiPress_Elementor::apply_widget_setting( $settings, 'heading:url', 'x' );
+
+		$this->assertInstanceOf( \WP_Error::class, $result );
+		$this->assertSame( 'not_an_object_field', $result->get_error_code() );
+		$this->assertSame( 'Titel', $settings['heading'] );
+	}
+
+	public function test_two_part_path_with_numeric_segment_is_refused_as_ambiguous(): void {
+		// "tabs:0" addresses a whole repeater ROW — writing one needs a sub-field.
+		$settings = array( 'tabs' => array( array( 'tab_title' => 'One' ) ) );
+
+		$result = \LuwiPress_Elementor::apply_widget_setting( $settings, 'tabs:0', 'x' );
+
+		$this->assertInstanceOf( \WP_Error::class, $result );
+		$this->assertSame( 'invalid_field_path', $result->get_error_code() );
+	}
+
+	public function test_two_part_path_on_a_missing_field_is_refused(): void {
+		$settings = array( 'heading' => 'x' );
+
+		$result = \LuwiPress_Elementor::apply_widget_setting( $settings, 'ghost_link:url', 'y' );
+
+		$this->assertInstanceOf( \WP_Error::class, $result );
+		$this->assertSame( 'not_an_object_field', $result->get_error_code() );
+		$this->assertArrayNotHasKey( 'ghost_link', $settings );
+	}
+
+	/* ── 2026-08-28 report #6: HTML must survive a repeater write ── */
+
+	public function test_html_survives_a_repeater_sub_field_write(): void {
+		$settings = array( 'tabs' => array( array( 'tab_title' => 'Q', 'tab_content' => 'plain' ) ) );
+		$html     = '<p>Vedi la <a href="https://tapadum.com/it/spedizioni/">pagina spedizioni</a>.</p>';
+
+		$this->assertTrue( \LuwiPress_Elementor::apply_widget_setting( $settings, 'tabs:0:tab_content', $html ) );
+		$this->assertSame( $html, $settings['tabs'][0]['tab_content'] );
+	}
 }

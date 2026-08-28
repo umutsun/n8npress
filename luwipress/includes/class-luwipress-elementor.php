@@ -1127,16 +1127,42 @@ class LuwiPress_Elementor {
     public static function apply_widget_setting( array &$settings, $field, $value ) {
         $field = (string) $field;
 
-        // ── Indexed repeater path: items:0:title ──
+        // ── Nested paths ──
         if ( false !== strpos( $field, self::REPEATER_PATH_SEPARATOR ) ) {
             $parts = explode( self::REPEATER_PATH_SEPARATOR, $field, 3 );
-            if ( count( $parts ) < 3 ) {
-                return new WP_Error(
-                    'invalid_field_path',
-                    sprintf( 'Field path "%s" must be "repeater_key:index:sub_field".', $field ),
-                    array( 'status' => 400 )
-                );
+
+            // Two segments address a key inside an OBJECT control -- most often a
+            // link control's url ("cta_url:url", "all_link:url"). Without this the
+            // only way to change a link was to resend the whole object, and a bare
+            // string write silently broke the rendered element (tapadum, 2026-08-28).
+            if ( 2 === count( $parts ) ) {
+                list( $object_key, $sub_key ) = $parts;
+                $object_key = sanitize_text_field( $object_key );
+
+                // "tabs:0" names a repeater ROW, not a value -- ambiguous on its own.
+                if ( is_numeric( $sub_key ) ) {
+                    return new WP_Error(
+                        'invalid_field_path',
+                        sprintf( 'Field path "%s" addresses a repeater row; use "%s:%s:<sub_field>".', $field, $object_key, $sub_key ),
+                        array( 'status' => 400 )
+                    );
+                }
+                if ( ! isset( $settings[ $object_key ] ) || ! is_array( $settings[ $object_key ] ) ) {
+                    return new WP_Error(
+                        'not_an_object_field',
+                        sprintf( 'Field "%s" is not an object control on this widget; read the widget first.', $object_key ),
+                        array( 'status' => 404 )
+                    );
+                }
+
+                $clean = self::sanitize_setting_value( $value );
+                if ( is_wp_error( $clean ) ) {
+                    return $clean;
+                }
+                $settings[ $object_key ][ sanitize_text_field( $sub_key ) ] = $clean;
+                return true;
             }
+
             list( $items_key, $index, $sub_field ) = $parts;
             $items_key = sanitize_text_field( $items_key );
             $sub_field = sanitize_text_field( $sub_field );
@@ -1183,6 +1209,47 @@ class LuwiPress_Elementor {
 
         $settings[ $key ] = $clean;
         return true;
+    }
+
+    /**
+     * Run a replacement over every link control in a settings array.
+     *
+     * Elementor stores links as arrays ({url, is_external, nofollow}), including
+     * inside repeater rows. The find-replace text scope reads the widget TEXT map
+     * and the styles scope only visits scalar settings, so link targets were
+     * unreachable from either — which left no practical way to repoint
+     * source-language URLs in translated pages (tapadum, 2026-08-28).
+     *
+     * @param array    $settings Settings array, modified in place.
+     * @param callable $replacer Receives the current url string, returns the new one.
+     * @param int      $depth    Recursion guard.
+     * @return int Number of url values actually changed.
+     */
+    public static function replace_in_link_fields( array &$settings, $replacer, $depth = 0 ) {
+        if ( $depth > 12 ) {
+            return 0;
+        }
+
+        $changed = 0;
+        foreach ( $settings as $key => &$value ) {
+            if ( ! is_array( $value ) ) {
+                continue;
+            }
+
+            if ( isset( $value['url'] ) && is_string( $value['url'] ) && '' !== $value['url'] ) {
+                $new = (string) call_user_func( $replacer, $value['url'] );
+                if ( $new !== $value['url'] ) {
+                    $value['url'] = $new;
+                    $changed++;
+                }
+            }
+
+            // Repeater rows and other nested structures.
+            $changed += self::replace_in_link_fields( $value, $replacer, $depth + 1 );
+        }
+        unset( $value );
+
+        return $changed;
     }
 
     /**
@@ -3015,10 +3082,14 @@ class LuwiPress_Elementor {
         }
 
         $count = 0;
-        $do_text   = in_array( $scope, array( 'text', 'both' ), true );
-        $do_styles = in_array( $scope, array( 'styles', 'both' ), true );
+        // 'both' stays text+styles for back-compat; 'all' adds link controls, and
+        // 'links' targets them alone (tapadum 2026-08-28: link URLs were reachable
+        // from no scope at all).
+        $do_text   = in_array( $scope, array( 'text', 'both', 'all' ), true );
+        $do_styles = in_array( $scope, array( 'styles', 'both', 'all' ), true );
+        $do_links  = in_array( $scope, array( 'links', 'all' ), true );
 
-        $this->walk_elements_modify( $data, function( &$element ) use ( $find, $replace, $is_regex, $do_text, $do_styles, $style_key, &$count ) {
+        $this->walk_elements_modify( $data, function( &$element ) use ( $find, $replace, $is_regex, $do_text, $do_styles, $do_links, $style_key, &$count ) {
             if ( ! isset( $element['settings'] ) || ! is_array( $element['settings'] ) ) {
                 return;
             }
@@ -3037,8 +3108,11 @@ class LuwiPress_Elementor {
                         ? preg_replace( $find, $replace, $value, -1, $n )
                         : str_replace( $find, $replace, $value, $n );
                     if ( $n > 0 && $new !== null ) {
-                        $element['settings'][ $key ] = $new;
-                        $count += $n;
+                        // $key can be a repeater path ("tabs:0:tab_title") — assigning
+                        // it flat would write a key the renderer ignores.
+                        if ( ! is_wp_error( self::apply_widget_setting( $element['settings'], $key, $new ) ) ) {
+                            $count += $n;
+                        }
                     }
                 }
             }
@@ -3060,6 +3134,20 @@ class LuwiPress_Elementor {
                         $count += $n;
                     }
                 }
+            }
+
+            // Links scope: link controls are ARRAYS ({url, is_external, nofollow}),
+            // top level and inside repeater rows, so neither scope above reaches them.
+            if ( $do_links ) {
+                $count += self::replace_in_link_fields(
+                    $element['settings'],
+                    function ( $url ) use ( $find, $replace, $is_regex ) {
+                        $out = $is_regex
+                            ? preg_replace( $find, $replace, $url )
+                            : str_replace( $find, $replace, $url );
+                        return null === $out ? $url : $out;
+                    }
+                );
             }
         } );
 

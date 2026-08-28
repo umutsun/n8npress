@@ -4,7 +4,7 @@ Tags: mcp, ai, automation, claude, anthropic, woocommerce, rest-api
 Requires at least: 5.6
 Tested up to: 7.0
 Requires PHP: 7.4
-Stable tag: 1.0.51
+Stable tag: 1.0.52
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -57,6 +57,11 @@ No. Tools delegate to LuwiPress core classes (AI Engine, Translation, Elementor,
 Bearer token via `Authorization: Bearer <token>` header or a logged-in WordPress admin session. The token is the same one configured in LuwiPress → Settings → Connection.
 
 == Changelog ==
+
+= 1.0.52 — Link-field writes + sanitizer fixes (paired with core 3.17.5) =
+* **`elementor_set_widget_text` writes link controls.** Pass the whole object (`{"cta_url": {"url": "/it/luthiers/"}}`) or address one key with a two-part path (`{"cta_url:url": "/it/luthiers/"}`). A path that names a scalar field returns `not_an_object_field`; `"tabs:0"` (a repeater row without a sub-field) returns `invalid_field_path`. Nothing is written on error.
+* **`elementor_replace_text` gains `scope: "links"` and `scope: "all"`.** Link URLs live in arrays and were invisible to `text`, `styles` and `both` — this is the practical way to repoint source-language URLs left in translated pages. Replacements landing inside repeater rows are now written to the row instead of a flat key the renderer ignores.
+* **`meta_set` / `meta_set_bulk` preserve HTML** (`wp_kses_post` instead of `sanitize_text_field`, which stripped every tag), and **refuse `_elementor_data`** and friends — writing page layout through them destroyed all markup on the page. The error names the tool to use instead.
 
 = 1.0.51 — See and cancel the Elementor translation queue (paired with core 3.17.4) =
 * **New: `elementor_translation_queue`** — lists the PENDING background page-translation jobs that `translation_status` cannot see (it only counts the standard, non-Elementor path). Each entry reports the post, language, when it is due, attempts used against the cap, and the last recorded phase.
