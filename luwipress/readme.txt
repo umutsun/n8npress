@@ -4,7 +4,7 @@ Tags: woocommerce, ai, seo, translation, automation, product enrichment, multili
 Requires at least: 5.6
 Tested up to: 7.0
 Requires PHP: 7.4
-Stable tag: 3.17.5
+Stable tag: 3.17.6
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -129,6 +129,9 @@ Set a daily budget limit in Settings → AI API Keys. When reached, all AI featu
 6. Activity log with workflow results
 
 == Changelog ==
+
+= 3.17.6 — Fix: the new link search scopes were rejected =
+* **Fixed: "links" and "all" search scopes returned an error.** The find-and-replace engine understood both new scopes and they were listed in the tool, but the request check still only accepted the three old ones — so the documented scope failed outright. Both now work as described.
 
 = 3.17.5 — Link fields are editable, and edits stop being silently discarded =
 * **Button and card links can finally be edited.** Elementor stores a link as a small object, and no editing tool could write one — so translated pages kept pointing at their source-language URLs. Links can now be set whole, or one part at a time (for example just the address), from the same tools as any other field.

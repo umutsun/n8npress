@@ -1212,6 +1212,16 @@ class LuwiPress_Elementor {
     }
 
     /**
+     * Accepted find-replace scopes.
+     *
+     * Single source of truth for the entry-point allowlist AND the scope flags in
+     * find_replace_on_post(). They drifted once: 'links'/'all' were taught to the
+     * walker and published in the MCP schema while this allowlist still rejected
+     * them, so the documented scope 400'd (caught on tapadum, 2026-08-28).
+     */
+    const FIND_REPLACE_SCOPES = array( 'text', 'styles', 'both', 'links', 'all' );
+
+    /**
      * Run a replacement over every link control in a settings array.
      *
      * Elementor stores links as arrays ({url, is_external, nofollow}), including
@@ -3031,8 +3041,12 @@ class LuwiPress_Elementor {
         if ( $replace === null ) {
             return new WP_Error( 'missing_params', 'replace parameter required', array( 'status' => 400 ) );
         }
-        if ( ! in_array( $scope, array( 'text', 'styles', 'both' ), true ) ) {
-            return new WP_Error( 'invalid_scope', 'scope must be text, styles, or both', array( 'status' => 400 ) );
+        if ( ! in_array( $scope, self::FIND_REPLACE_SCOPES, true ) ) {
+            return new WP_Error(
+                'invalid_scope',
+                'scope must be one of: ' . implode( ', ', self::FIND_REPLACE_SCOPES ),
+                array( 'status' => 400 )
+            );
         }
         if ( $is_regex ) {
             // @ suppresses preg warning to evaluate pattern validity

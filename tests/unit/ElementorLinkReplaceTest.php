@@ -95,4 +95,29 @@ class ElementorLinkReplaceTest extends TestCase {
 		$settings = array();
 		$this->assertSame( 0, \LuwiPress_Elementor::replace_in_link_fields( $settings, $this->replacer( 'a', 'b' ) ) );
 	}
+
+	/* ── drift guard: allowlist must cover every scope the walker understands ── */
+
+	public function test_scope_allowlist_contains_the_link_scopes(): void {
+		$this->assertContains( 'links', \LuwiPress_Elementor::FIND_REPLACE_SCOPES );
+		$this->assertContains( 'all', \LuwiPress_Elementor::FIND_REPLACE_SCOPES );
+	}
+
+	public function test_scope_allowlist_keeps_the_legacy_scopes(): void {
+		foreach ( array( 'text', 'styles', 'both' ) as $legacy ) {
+			$this->assertContains( $legacy, \LuwiPress_Elementor::FIND_REPLACE_SCOPES );
+		}
+	}
+
+	public function test_every_declared_scope_enables_at_least_one_pass(): void {
+		// Mirrors the flags in find_replace_on_post(): a scope that enables nothing
+		// would silently report "no changes" instead of failing loudly.
+		$text   = array( 'text', 'both', 'all' );
+		$styles = array( 'styles', 'both', 'all' );
+		$links  = array( 'links', 'all' );
+		foreach ( \LuwiPress_Elementor::FIND_REPLACE_SCOPES as $scope ) {
+			$enabled = in_array( $scope, $text, true ) || in_array( $scope, $styles, true ) || in_array( $scope, $links, true );
+			$this->assertTrue( $enabled, "scope '{$scope}' enables no replacement pass" );
+		}
+	}
 }
