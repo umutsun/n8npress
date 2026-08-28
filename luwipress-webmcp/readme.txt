@@ -4,7 +4,7 @@ Tags: mcp, ai, automation, claude, anthropic, woocommerce, rest-api
 Requires at least: 5.6
 Tested up to: 7.0
 Requires PHP: 7.4
-Stable tag: 1.0.52
+Stable tag: 1.0.53
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -57,6 +57,10 @@ No. Tools delegate to LuwiPress core classes (AI Engine, Translation, Elementor,
 Bearer token via `Authorization: Bearer <token>` header or a logged-in WordPress admin session. The token is the same one configured in LuwiPress → Settings → Connection.
 
 == Changelog ==
+
+= 1.0.53 — plugins_update no longer leaves a plugin switched off =
+* **Fixed: `plugins_update` took the updated plugin offline.** WordPress deactivates a plugin before replacing its files and only turns it back on inside wp-admin — so updating through this tool left the plugin INACTIVE. On a live site that meant pages kept rendering while every REST route from that plugin vanished. The tool now records the prior state and reactivates, and the response reports `was_active` / `active` / `reactivated`.
+* **Do not update WebMCP through itself.** If reactivation ever fails there is no MCP endpoint left to recover with — update WebMCP from wp-admin. The tool description says so now.
 
 = 1.0.52 — Link-field writes + sanitizer fixes (paired with core 3.17.5) =
 * **`elementor_set_widget_text` writes link controls.** Pass the whole object (`{"cta_url": {"url": "/it/luthiers/"}}`) or address one key with a two-part path (`{"cta_url:url": "/it/luthiers/"}`). A path that names a scalar field returns `not_an_object_field`; `"tabs:0"` (a repeater row without a sub-field) returns `invalid_field_path`. Nothing is written on error.

@@ -8639,7 +8639,7 @@ class LuwiPress_WebMCP {
         // ── Plugin Update ──
 
         $this->register_tool( 'plugins_update', array(
-            'description' => 'Update an installed plugin to its latest version from WordPress.org',
+            'description' => 'Update an installed plugin to its latest version. Restores the previous ACTIVE state afterwards — WordPress deactivates a plugin before replacing its files and does not turn it back on outside wp-admin, which silently takes the plugin offline. The response reports was_active / active / reactivated. NOTE: do not update the WebMCP plugin through itself — if reactivation fails there is no MCP endpoint left to recover with; update WebMCP from wp-admin.',
             'inputSchema' => array(
                 'type'       => 'object',
                 'properties' => array(
@@ -8664,6 +8664,13 @@ class LuwiPress_WebMCP {
 
             $old_version = $all[ $plugin ]['Version'];
 
+            // Plugin_Upgrader deactivates the target before replacing its files
+            // (upgrader_pre_install -> deactivate_plugin_before_upgrade) and does NOT
+            // restore it outside the wp-admin flow. Updating LuwiPress core this way
+            // left it INACTIVE on tapadum: the site kept serving pages but every core
+            // REST route vanished (2026-08-28). Remember the state and put it back.
+            $was_active = is_plugin_active( $plugin );
+
             $skin     = new WP_Ajax_Upgrader_Skin();
             $upgrader = new Plugin_Upgrader( $skin );
             $result   = $upgrader->upgrade( $plugin );
@@ -8672,13 +8679,30 @@ class LuwiPress_WebMCP {
                 throw new Exception( $result->get_error_message() );
             }
 
+            $reactivated = null;
+            if ( $was_active && ! is_plugin_active( $plugin ) ) {
+                $activation  = activate_plugin( $plugin );
+                $reactivated = is_wp_error( $activation ) ? $activation->get_error_message() : true;
+                if ( true !== $reactivated ) {
+                    LuwiPress_Logger::log( "WebMCP: {$plugin} updated but could NOT be reactivated: {$reactivated}", 'error', 'webmcp' );
+                }
+            }
+
             // Re-read to get new version
             $updated  = get_plugins();
             $new_ver  = isset( $updated[ $plugin ] ) ? $updated[ $plugin ]['Version'] : $old_version;
 
             LuwiPress_Logger::log( "Plugin updated via WebMCP: {$plugin} ({$old_version} → {$new_ver})", 'info', 'webmcp' );
 
-            return array( 'plugin' => $plugin, 'old_version' => $old_version, 'new_version' => $new_ver, 'updated' => $old_version !== $new_ver );
+            return array(
+                'plugin'      => $plugin,
+                'old_version' => $old_version,
+                'new_version' => $new_ver,
+                'updated'     => $old_version !== $new_ver,
+                'was_active'  => $was_active,
+                'active'      => is_plugin_active( $plugin ),
+                'reactivated' => $reactivated,
+            );
         } );
 
         $this->register_tool( 'themes_list', array(
